@@ -35,8 +35,13 @@ A single-page Three.js demo of probe-grid Dynamic Diffuse Global Illumination (D
 | 4a. emissiveNode plumbing | ✓ | Constant emissive (mode 1) verified via diagnostic selector |
 | 4b. SH data → shader (DataTexture) | ✗ | `texture(probeSHTex, ...)` returned vec3(0,0,0) — silent upload failure |
 | 4c. SH data → shader (uniformArray) | ✓ | `uniformArray(probeSHFlat, 'vec3').element(idx)` works; subtle but correct color bleed visible at wall/floor corners |
-| 5. Tune GI intensity to match WebGL | runtime knobs | GI intensity slider widened to 0–15, default 3.0; `Apply 1/π factor` toggle (default OFF) lets the user A/B against the textbook Lambertian formulation. Math is identical to WebGL on paper; the brightness deficit appears to come from tone mapping being silently applied during WebGPU probe captures. |
-| 6. Depth-aware Chebyshev visibility | not started | The "real" DDGI correctness fix |
+| 5a. Match WebGL math | ✓ | Default `applyPiFactor=true`, `uGiIntensity=1.0`, slider 0..3 — equivalent to WebGL's `gi × albedo / π × intensity` BRDF integration |
+| 5b. Bypass tone mapping in cube capture | ✓ | NodeMaterial bakes tone mapping into the shader graph, so `renderer.toneMapping = NoToneMapping` doesn't propagate mid-frame; force `material.toneMapped = false` per-material during capture |
+| 5c. Multi-bounce priming | ✓ | 3 priming sweeps before first visible frame so passive multi-bounce GI is in place immediately, plus ~one-probe-per-frame cadence in the render loop |
+| 5d. PointLight rebalance | ✓ | Reduce `keyLight` intensity 18 → 2.5 to match the WebGL `RectAreaLight`'s hemispherical flux (PointLight is omnidirectional, so 18 was driving probes to multi-bounce-saturation under the new math) |
+| 6a. Probe depth capture | ✓ | Custom `MeshBasicNodeMaterial` with `colorNode = length(positionWorld − probePos)` rendered via `scene.overrideMaterial` in a second cube-camera pass per probe; reuses the existing radiance cube target since SH coefficients are already extracted before depth overwrites |
+| 6b. Per-probe depth aggregation | ✓ | Mean depth + mean-depth-squared per probe (2 floats × 64 probes), exposed as TSL `uniformArray('float')` — same workaround pattern used for SH data |
+| 6c. Chebyshev visibility test | ✓ | `chebyshev = σ² / (σ² + max(0, dist − μ − bias)²)` multiplies each of the 8 trilinear weights in `giSampleFn`. Initial `μ = 100` keeps untrained probes at full visibility so priming ramps up smoothly. GUI exposes a toggle and a bias slider |
 
 ## The 5-phase diagnostic selector
 
@@ -63,13 +68,12 @@ This is what bisected the bug: mode 1 worked, mode 4 didn't — narrowing the fa
 4. **Temporal Dead Zone on `stats`.** A fire-and-forget probe update inside priming referenced a `const stats` declared later in the function, killing every probe's SH integration silently.
 5. **HDR emission via `MeshBasicNodeMaterial.colorNode`.** Setting `colorNode = vec3(8, 8, 7)` works only if you also set `material.toneMapped = false` to keep tone mapping out of it for the probe captures.
 6. **DataTexture upload to WebGPU.** `DataTexture(Float32Array, w, h, RGBAFormat, FloatType)` populated with SH coefficients, marked `needsUpdate = true` after each frame's CPU integration — never reaches the bind group from `texture(...)` in TSL. Returns `vec3(0)` to the shader. Workaround: keep the SH data as `Vector3[]` and expose via `uniformArray(arr, 'vec3').element(idx)` instead. 64 probes × 9 vec3 = 576 entries (≈6.75 KB) fits comfortably in WebGPU's uniform buffer limits.
-7. **Tone mapping during probe capture.** `renderer.toneMapping = NoToneMapping` is set before each `cubeCamera.update()` to keep HDR values intact (the ceiling panel emits at `8.0` linear). In WebGL this works — captures are linear-HDR. In WebGPU it appears the tone-mapping output node is part of compiled NodeMaterial pipelines and isn't toggled by the runtime change. The result: HDR `8.0` gets ACES-compressed to `~0.97` before the cube write, the SH integration sees a much darker scene, and the indirect contribution at runtime is roughly `1/π ≈ 3×` weaker than WebGL despite mathematically equivalent integration paths. The diagnostic confirmed this is *not* a doubled `1/π` factor — both backends produce `gi * albedo / π` on paper. The gap is in the captured `gi` value itself. Workaround for now: a wider intensity slider (0–15) and an "Apply 1/π factor" toggle in the GUI to dial in a value that matches the WebGL reference visually.
 
 ## Key architectural notes
 
 - The WebGL scene's GI integration point is `iblIrradiance` because that's where three.js's standard PBR lighting model accumulates indirect diffuse — adding to it gives proper energy-conserving contribution.
 - The WebGPU scene uses `material.emissiveNode` instead, which is added directly to the lit output post-light-model. For purely Lambertian surfaces (`roughness = 1.0, metalness = 0.0`) the math is equivalent: `albedo / π × irradiance`. For other materials this is an approximation.
-- The probe grid is offset 15% inside the box bounds to avoid putting probes on top of walls. A few probes still land inside the tall and short interior boxes — that's the "probes inside geometry contribute wrong values" problem that depth-aware visibility is supposed to solve (Phase 6, not started).
+- The probe grid is offset 15% inside the box bounds to avoid putting probes on top of walls. A few probes still land inside the tall and short interior boxes — that's the "probes inside geometry contribute wrong values" problem. Phase 6 solves it via depth-aware Chebyshev visibility: each probe's mean & variance of distance to nearest occluder is captured via a `scene.overrideMaterial` depth pass, and the trilinear blend weights are multiplied by `σ² / (σ² + max(0, dist − μ − bias)²)` so probes inside geometry (small μ, small σ²) contribute ~0 to shading points outside the geometry (large dist).
 
 ## Running
 

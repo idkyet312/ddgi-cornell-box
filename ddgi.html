@@ -367,6 +367,10 @@ async function createWebGPUScene(canvas) {
   bc('building TSL GI graph');
   let uGiMode = null, uGiEnabled = null, uGiIntensity = null, uGiPiFactor = null;
   let uProbeMin = null, uProbeMax = null, uProbeDims = null;
+  // Phase 6 — declared in the outer scope so updateOneProbe (defined below the TSL
+  // try-block) can use them; assigned inside the try-block where TSL is in scope.
+  let uChebyshevEnabled = null, uDepthBias = null, uDepthProbePos = null;
+  let depthMat = null;
   try {
     const { Fn, vec2, vec3, float, int, uniform, uniformArray, positionWorld, normalWorld } = TSL;
     uProbeMin    = uniform(PROBE_MIN.clone());
@@ -386,6 +390,30 @@ async function createWebGPUScene(canvas) {
 
     // SH coefficients exposed as TSL uniformArray of vec3 (length PROBE_COUNT * 9).
     const probeSHArray = uniformArray(probeSHFlat, 'vec3');
+
+    // === Phase 6 — depth-aware Chebyshev visibility ===
+    // Per-probe mean depth & mean-depth-squared. Initialised to "very far" so
+    // probes whose depth pass hasn't completed yet contribute at full weight,
+    // letting GI ramp up smoothly during priming. Once a probe's depth is
+    // captured, the values settle to the actual occluder distances and the
+    // Chebyshev test in giSampleFn culls probes that the shading point cannot
+    // "see". This is the proper DDGI correctness fix for probes-inside-boxes.
+    const probeDepthMeanArr   = new Array(PROBE_COUNT).fill(100.0);
+    const probeDepthMeanSqArr = new Array(PROBE_COUNT).fill(10000.0);
+    const uDepthMean        = uniformArray(probeDepthMeanArr,   'float');
+    const uDepthMeanSq      = uniformArray(probeDepthMeanSqArr, 'float');
+    uChebyshevEnabled       = uniform(1.0);
+    uDepthBias              = uniform(0.05);
+
+    // Depth-output material. During the second cube-camera pass per probe, this
+    // overrides the scene materials so each fragment writes its world-space
+    // distance to the current probe instead of radiance. Read back, integrated
+    // to mean & mean-squared, and uploaded to the uniform arrays above.
+    uDepthProbePos = uniform(new THREE.Vector3());
+    const fragDist = positionWorld.sub(uDepthProbePos).length().min(50.0);
+    depthMat = new MeshBasicNodeMaterial();
+    depthMat.colorNode  = vec3(fragDist);
+    depthMat.toneMapped = false;
 
     // Read SH coefficient k for probe pi (pi is a float node).
     // We need an integer index into the array; convert float→int.
@@ -418,7 +446,11 @@ async function createWebGPUScene(canvas) {
         .add(c8.mul(0.429043).mul(x.mul(x).sub(y.mul(y))));
     };
 
-    // Trilinear blend across 8 surrounding probes
+    // Trilinear blend across 8 surrounding probes, with Phase 6 Chebyshev
+    // visibility weighting. For each corner probe, in addition to the standard
+    // trilinear weight (volume of the opposite sub-cube), we compute a
+    // visibility weight from the probe's depth statistics — this is what makes
+    // probes-inside-boxes get culled instead of contributing wrong radiance.
     const giSampleFn = Fn(([wp, n]) => {
       const grid = wp.sub(uProbeMin).div(uProbeMax.sub(uProbeMin))
                    .clamp(vec3(0.0), vec3(1.0))
@@ -429,14 +461,37 @@ async function createWebGPUScene(canvas) {
       let sum  = vec3(0.0).toVar();
       let wSum = float(0.0).toVar();
 
+      // World-space probe spacing — used to recover each probe's world position
+      // from its grid index for the distance term in the Chebyshev test.
+      const probeSpacing = uProbeMax.sub(uProbeMin).div(uProbeDims.sub(vec3(1.0)));
+
       for (let i = 0; i < 8; i++) {
         const dx = i & 1, dy = (i >> 1) & 1, dz = (i >> 2) & 1;
         const offset = vec3(float(dx), float(dy), float(dz));
         const idx = baseIdx.add(offset).clamp(vec3(0.0), uProbeDims.sub(vec3(1.0)));
         const wAxis = vec3(float(1.0)).sub(frac).mix(frac, offset);
-        const weight = wAxis.x.mul(wAxis.y).mul(wAxis.z).max(float(0.0005));
+        const triWeight = wAxis.x.mul(wAxis.y).mul(wAxis.z).max(float(0.0005));
         const pi = idx.x.add(idx.y.mul(uProbeDims.x)).add(idx.z.mul(uProbeDims.x).mul(uProbeDims.y));
-        const irr = evalSH(n, pi);  // vec3 now (uniformArray-based)
+        const piInt = int(pi);
+
+        // Phase 6 — Chebyshev visibility test (Majercik et al. 2019).
+        //   chebyshev(t, μ, σ²) = σ² / (σ² + max(0, t − μ − bias)²)
+        // ≈ 1 when the shading point is no further from the probe than the
+        // probe's average occluder distance (probe is "visible" to the point);
+        // → 0 when the point is much further than the probe's occluders
+        // (probe is geometrically occluded). bias prevents over-shadowing right
+        // at the surface. Toggleable via uChebyshevEnabled.
+        const probeWorld  = uProbeMin.add(idx.mul(probeSpacing));
+        const dist        = wp.sub(probeWorld).length();
+        const dMean       = uDepthMean.element(piInt);
+        const dMeanSq     = uDepthMeanSq.element(piInt);
+        const variance    = dMeanSq.sub(dMean.mul(dMean)).max(float(1e-4));
+        const distExcess  = dist.sub(dMean).sub(uDepthBias).max(float(0.0));
+        const chebyshev   = variance.div(variance.add(distExcess.mul(distExcess))).clamp(0.0, 1.0);
+        const visWeight   = float(1.0).mix(chebyshev, uChebyshevEnabled);
+
+        const weight = triWeight.mul(visWeight);
+        const irr = evalSH(n, pi);  // vec3 (uniformArray-based)
         sum  = sum.add(irr.mul(weight));
         wSum = wSum.add(weight);
       }
@@ -624,6 +679,26 @@ async function createWebGPUScene(canvas) {
     return sh;
   }
 
+  // Phase 6 — integrate per-probe depth statistics (mean & mean-squared) from a
+  // cube-camera target rendered with the depth-output material. Uniform per-texel
+  // weighting is fine here: these are aggregate stats, not direction-dependent
+  // SH — they encode "how far does this probe see, on average, plus variance".
+  async function integrateDepthStats(rt) {
+    let sum = 0, sumSq = 0, count = 0;
+    const allFaces = await Promise.all([0,1,2,3,4,5].map(f => readCubeFace(rt, f)));
+    for (let f=0; f<6; f++) {
+      const data = allFaces[f];
+      const isHalf = data instanceof Uint16Array;
+      for (let i=0; i<FACE_SIZE*FACE_SIZE; i++) {
+        const d = isHalf ? f16ToF32(data[i*4+0]) : data[i*4+0];
+        sum   += d;
+        sumSq += d * d;
+        count++;
+      }
+    }
+    return { mean: sum / count, meanSq: sumSq / count };
+  }
+
   // declare stats early so updateOneProbe (called during priming, before render loop) can use it
   const stats = new Stats();
   let nextProbeToUpdate = 0;
@@ -671,6 +746,29 @@ async function createWebGPUScene(canvas) {
           Math.max(0, Math.min(1, c.y * sc)),
           Math.max(0, Math.min(1, c.z * sc))
         );
+
+        // Phase 6 — depth pass for Chebyshev visibility. Re-render this probe's
+        // cube map with the depth-output material so each fragment writes its
+        // distance to the probe instead of radiance, then integrate to mean &
+        // mean-squared. This overwrites the radiance in probeRadianceRT[idx],
+        // which is fine because we already extracted the SH coefficients above.
+        if (depthMat && uDepthProbePos) {
+          uDepthProbePos.value.copy(probePositions[idx]);
+          const prevOverride = scene.overrideMaterial;
+          const oldTM2 = renderer.toneMapping;
+          renderer.toneMapping = THREE.NoToneMapping;
+          scene.overrideMaterial = depthMat;
+          cam.update(renderer, scene);
+          scene.overrideMaterial = prevOverride;
+          renderer.toneMapping = oldTM2;
+          try {
+            const ds = await integrateDepthStats(probeRadianceRT[idx]);
+            probeDepthMeanArr[idx]   = ds.mean;
+            probeDepthMeanSqArr[idx] = ds.meanSq;
+          } catch (e) {
+            console.warn(`Probe ${idx} depth integration failed:`, e.message);
+          }
+        }
         stats.totalProbeUpdates++;
       } catch (e) {
         console.warn(`Probe ${idx} integration failed:`, e.message, e.stack);
@@ -716,6 +814,8 @@ async function createWebGPUScene(canvas) {
     giEnabled: true,
     giIntensity: 1.0,                  // Phase 5a — match WebGL default
     applyPiFactor: true,               // Phase 5a — match WebGL Lambertian BRDF
+    chebyshevEnabled: true,            // Phase 6 — depth-aware visibility
+    depthBias: 0.05,                   // Phase 6 — Chebyshev bias
   };
   const gui = new GUI({ title: 'DDGI · WebGPU (diagnostic)', width: 320 });
   if (uGiMode) gui.add(params, 'giMode', Object.keys(giModes)).name('GI phase').onChange(v => {
@@ -726,6 +826,9 @@ async function createWebGPUScene(canvas) {
   // Phase 5a — slider range matches the WebGL scene (0..3) for direct A/B comparison.
   if (uGiIntensity) gui.add(params, 'giIntensity', 0, 3, 0.05).name('GI intensity').onChange(v => uGiIntensity.value = v);
   if (uGiPiFactor)  gui.add(params, 'applyPiFactor').name('Apply 1/π factor').onChange(v => uGiPiFactor.value = v ? 1 : 0);
+  // Phase 6 — Chebyshev visibility test toggle + depth bias tuning.
+  if (uChebyshevEnabled) gui.add(params, 'chebyshevEnabled').name('Chebyshev visibility').onChange(v => uChebyshevEnabled.value = v ? 1 : 0);
+  if (uDepthBias)        gui.add(params, 'depthBias', 0, 0.5, 0.005).name('Depth bias').onChange(v => uDepthBias.value = v);
   gui.add(params, 'showProbes').name('Show probes').onChange(v => debugProbeGroup.visible = v);
   gui.add(params, 'exposure', 0.2, 2.0, 0.05).name('Exposure').onChange(v => renderer.toneMappingExposure = v);
 
