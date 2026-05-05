@@ -339,6 +339,8 @@ async function createWebGPUScene(canvas) {
   probeSHTex.magFilter = THREE.NearestFilter;
   probeSHTex.wrapS = THREE.ClampToEdgeWrapping;
   probeSHTex.wrapT = THREE.ClampToEdgeWrapping;
+  probeSHTex.colorSpace = THREE.NoColorSpace;  // raw float data, no sRGB transform
+  probeSHTex.flipY = false;                    // we author rows in upload order
   probeSHTex.needsUpdate = true;
 
   function uploadProbeSHToTex(idx, sh) {
@@ -372,7 +374,7 @@ async function createWebGPUScene(canvas) {
     uProbeDims   = uniform(PROBE_DIMS.clone());
     uGiIntensity = uniform(1.0);
     uGiEnabled   = uniform(1.0);
-    uGiMode      = uniform(1.0);  // start in CONST mode for safety
+    uGiMode      = uniform(4.0);  // start in SH probe[0] mode — isolates SH eval from trilinear blend
 
     // Read SH coefficient k for probe pi (pi is a float node)
     const readSH = (probeIdxFloat, k) => {
@@ -456,11 +458,13 @@ async function createWebGPUScene(canvas) {
       // Phase 3: world-normal tint. Map [-1,1] → [0,1].
       const cNormal = N.mul(0.5).add(vec3(0.5)).mul(0.4);
 
-      // Phase 4: SH eval at probe[0], scaled. No trilinear, no albedo.
-      // If this looks reasonable (smooth gradient with the captured colours), then
-      // texture sampling + evalSH math are correct.
-      const sh0 = evalSH(N, float(0.0)).rgb.max(vec3(0.0));
-      const cSh0 = sh0.mul(0.3);
+      // Phase 4: read SH band-0 texel for probe[0] DIRECTLY — no eval, no trilinear.
+      // This is the rawest possible diagnostic of the texture-upload path. If the
+      // probe data texture is populated, we should see a near-uniform tint reflecting
+      // probe[0]'s ambient irradiance. If we see PURE BLACK, the texture upload is
+      // failing somewhere (most likely cause of the Phase 4 white-edge bug).
+      const probeSHRead = texture(probeSHTex, vec2(float(0.5/9.0), float(0.5/PROBE_COUNT)));
+      const cSh0 = probeSHRead.rgb.max(vec3(0.0)).mul(0.5);
 
       // Phase 5: full GI, Lambertian.
       const giRaw = giSampleFn(positionWorld, N);
@@ -662,7 +666,7 @@ async function createWebGPUScene(canvas) {
     '5 — full trilinear': 5,
   };
   const params = {
-    giMode: '1 — const orange',
+    giMode: '4 — SH probe[0]',
     exposure: 1.0,
     showProbes: false,
     giEnabled: true,
