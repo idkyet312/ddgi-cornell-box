@@ -1,0 +1,1088 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<title>DDGI Cornell Box — WebGL & WebGPU</title>
+<style>
+  html, body { margin: 0; padding: 0; overflow: hidden; background: #000; color: #eee; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+  #scene-picker {
+    position: absolute; top: 12px; left: 50%; transform: translateX(-50%); z-index: 20;
+    background: rgba(0,0,0,0.6); padding: 4px; border-radius: 8px;
+    border: 1px solid rgba(255,255,255,0.1); display: flex; gap: 2px;
+  }
+  #scene-picker button {
+    background: transparent; color: #ccc; border: 0; padding: 8px 16px;
+    font-family: inherit; font-size: 12px; cursor: pointer; border-radius: 6px;
+    transition: background 0.15s, color 0.15s;
+  }
+  #scene-picker button:hover { background: rgba(255,255,255,0.06); color: #fff; }
+  #scene-picker button.active { background: #fff; color: #000; }
+  #scene-picker button:disabled { color: #666; cursor: not-allowed; }
+  #scene-picker button:disabled:hover { background: transparent; }
+  #info {
+    position: absolute; top: 56px; left: 12px; z-index: 10;
+    background: rgba(0,0,0,0.55); padding: 10px 14px; border-radius: 6px;
+    font-size: 12px; line-height: 1.5; max-width: 340px; pointer-events: none;
+    border: 1px solid rgba(255,255,255,0.08);
+  }
+  #info b { color: #fff; font-size: 13px; }
+  #info span.tag { display: inline-block; background: rgba(255,255,255,0.08); padding: 1px 6px; border-radius: 3px; font-size: 10px; margin-left: 4px; vertical-align: 1px; }
+  #info span.tag.fix { background: rgba(120,200,90,0.18); color: #aaffa0; }
+  #stats { position: absolute; top: 56px; right: 12px; z-index: 10; background: rgba(0,0,0,0.55); padding: 8px 12px; border-radius: 6px; font-size: 11px; font-family: monospace; border: 1px solid rgba(255,255,255,0.08); }
+  #status {
+    position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); z-index: 30;
+    background: rgba(0,0,0,0.9); border: 1px solid rgba(255,255,255,0.12);
+    padding: 18px 26px; border-radius: 10px; font-size: 13px; max-width: 600px; min-width: 320px; text-align: center;
+    display: none;
+  }
+  #status details { color: #ccc; }
+  #status details summary { color: #999; }
+  #status details > div { color: #aaa; }
+  #status.show { display: block; }
+  #status .err { color: #ff8a80; }
+  canvas { display: block; }
+  #canvas-container { position: absolute; inset: 0; }
+</style>
+</head>
+<body>
+
+<div id="scene-picker">
+  <button data-scene="webgl" class="active">WebGL · basic</button>
+  <button data-scene="webgpu">WebGPU · depth-aware</button>
+</div>
+
+<div id="info">
+  <b>DDGI Cornell Box</b>
+  <span class="tag" id="tag-mode">three.js · WebGL</span>
+  <div id="info-body" style="margin-top:6px; opacity:0.85;"></div>
+  <div style="margin-top:6px; opacity:0.7;">Drag to orbit · scroll to zoom</div>
+</div>
+
+<div id="stats">probes updated: <span id="updateCount">0</span><br/>fps: <span id="fps">—</span></div>
+
+<div id="status"></div>
+
+<div id="canvas-container"></div>
+
+<script type="importmap">
+{
+  "imports": {
+    "three":            "https://cdn.jsdelivr.net/npm/three@0.172.0/build/three.module.js",
+    "three/webgpu":     "https://cdn.jsdelivr.net/npm/three@0.172.0/build/three.webgpu.js",
+    "three/tsl":        "https://cdn.jsdelivr.net/npm/three@0.172.0/build/three.tsl.js",
+    "three/addons/":    "https://cdn.jsdelivr.net/npm/three@0.172.0/examples/jsm/"
+  }
+}
+</script>
+
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { RectAreaLightUniformsLib } from 'three/addons/lights/RectAreaLightUniformsLib.js';
+import GUI from 'https://cdn.jsdelivr.net/npm/lil-gui@0.19.2/+esm';
+
+// WebGPU-only imports — loaded lazily so a browser without WebGPU can still run the WebGL scene.
+let WebGPUImports = null;
+async function loadWebGPUImports() {
+  if (WebGPUImports) return WebGPUImports;
+  const [gpu, tsl] = await Promise.all([
+    import('three/webgpu'),
+    import('three/tsl'),
+  ]);
+  WebGPUImports = { ...gpu, TSL: tsl };
+  return WebGPUImports;
+}
+
+// ---------- shared constants ----------
+const BOX = { x: 1.0, y: 1.0, z: 1.0 };
+const PROBE_DIMS = new THREE.Vector3(4, 4, 4);
+const PROBE_MIN  = new THREE.Vector3(-BOX.x * 0.85, 0.15,            -BOX.z * 0.85);
+const PROBE_MAX  = new THREE.Vector3( BOX.x * 0.85, 2*BOX.y - 0.15,   BOX.z * 0.85);
+const PROBE_COUNT = PROBE_DIMS.x * PROBE_DIMS.y * PROBE_DIMS.z;
+
+// ---------- global error surfacing (so we can see failures without devtools) ----------
+window.addEventListener('error', (e) => {
+  const el = document.getElementById('status');
+  el.classList.add('show');
+  el.innerHTML = `<span class="err"><b>JS error</b><br>${e.message || e.error?.message || 'unknown'}<br><small>${e.filename || ''}${e.lineno ? ':'+e.lineno : ''}</small></span>`;
+  console.error('[caught]', e);
+});
+window.addEventListener('unhandledrejection', (e) => {
+  const el = document.getElementById('status');
+  el.classList.add('show');
+  el.innerHTML = `<span class="err"><b>Unhandled promise rejection</b><br>${e.reason?.message || e.reason || 'unknown'}</span>`;
+  console.error('[unhandledrejection]', e);
+});
+
+// ---------- scene host ----------
+const container = document.getElementById('canvas-container');
+const statusEl  = document.getElementById('status');
+const tagEl     = document.getElementById('tag-mode');
+const infoBody  = document.getElementById('info-body');
+const updateCountEl = document.getElementById('updateCount');
+const fpsEl     = document.getElementById('fps');
+
+let currentSceneInstance = null;
+let currentSceneKey = null;
+
+const sceneInfos = {
+  webgl: {
+    tag: 'three.js · WebGL',
+    body: 'A 4×4×4 grid of irradiance probes captures the scene via cubemap renders, converts to L2 spherical harmonics, and is blended trilinearly per fragment to add indirect light.'
+  },
+  webgpu: {
+    tag: 'three.js · WebGPU · GI',
+    body: 'WebGPU + NodeMaterials + DDGI. 4×4×4 probe grid captured via cubemap renders, SH integrated on CPU, sampled via TSL with trilinear blend. Multi-bounce accumulates passively as probes refresh. Toggle GI in GUI to A/B against direct-only.'
+  }
+};
+
+function setStatus(html, isError = false) {
+  if (!html) { statusEl.classList.remove('show'); return; }
+  statusEl.innerHTML = isError ? `<span class="err">${html}</span>` : html;
+  statusEl.classList.add('show');
+}
+
+// breadcrumb stack — visible to user during loadScene
+const breadcrumbs = [];
+function bc(msg) {
+  breadcrumbs.push(msg);
+  console.log('[bc]', msg);
+  // throttle DOM update — only show last 8
+  const list = breadcrumbs.slice(-8).map(m => `<div>· ${m}</div>`).join('');
+  if (statusEl.classList.contains('show')) {
+    const head = statusEl.querySelector('[data-head]');
+    if (head) statusEl.querySelector('[data-bc]').innerHTML = list;
+  }
+}
+
+function setSceneInfo(key) {
+  tagEl.textContent = sceneInfos[key].tag;
+  infoBody.textContent = sceneInfos[key].body;
+}
+
+async function loadScene(key) {
+  if (currentSceneKey === key) return;
+  breadcrumbs.length = 0;
+  // tear down
+  if (currentSceneInstance) {
+    try { currentSceneInstance.dispose(); } catch (e) { console.warn(e); }
+    currentSceneInstance = null;
+  }
+  // remove old canvas + GUIs
+  container.innerHTML = '';
+  document.querySelectorAll('.lil-gui').forEach(el => el.remove());
+
+  // mark active button
+  document.querySelectorAll('#scene-picker button').forEach(b => {
+    b.classList.toggle('active', b.dataset.scene === key);
+  });
+
+  // initialize status with breadcrumb area
+  statusEl.innerHTML = `<div data-head><b>Loading ${key}…</b></div><div data-bc style="margin-top:8px; font-size:11px; opacity:0.75; text-align:left; font-family:monospace;"></div>`;
+  statusEl.classList.add('show');
+  setSceneInfo(key);
+
+  const canvas = document.createElement('canvas');
+  container.appendChild(canvas);
+
+  bc(`loadScene(${key}) started`);
+
+  try {
+    if (key === 'webgl') {
+      currentSceneInstance = await createWebGLScene(canvas);
+    } else if (key === 'webgpu') {
+      currentSceneInstance = await createWebGPUScene(canvas);
+    }
+    currentSceneKey = key;
+    setStatus('');
+  } catch (err) {
+    console.error(err);
+    const stack = (err && err.stack) ? String(err.stack).split('\n').slice(0, 6).join('<br/>') : '';
+    statusEl.innerHTML = `<span class="err">
+      <b>Failed to load ${key} scene</b><br/>
+      <span style="font-family:monospace; font-size:11px;">${err.message || err}</span>
+      <details style="margin-top:8px; text-align:left;"><summary style="cursor:pointer; font-size:11px;">stack + breadcrumbs</summary>
+        <div style="font-family:monospace; font-size:10px; margin-top:6px; opacity:0.85;">${stack}</div>
+        <div style="font-family:monospace; font-size:10px; margin-top:6px; opacity:0.65;">${breadcrumbs.map(m => '· ' + m).join('<br/>')}</div>
+      </details>
+    </span>`;
+    statusEl.classList.add('show');
+    // restore old button highlight
+    document.querySelectorAll('#scene-picker button').forEach(b => {
+      b.classList.toggle('active', b.dataset.scene === currentSceneKey);
+    });
+  }
+}
+
+document.querySelectorAll('#scene-picker button').forEach(b => {
+  b.addEventListener('click', () => loadScene(b.dataset.scene));
+});
+
+// detect WebGPU support
+if (!('gpu' in navigator)) {
+  const btn = document.querySelector('button[data-scene="webgpu"]');
+  btn.disabled = true;
+  btn.title = 'WebGPU not available in this browser';
+}
+
+// ---------- helper: shared FPS / probe-count tracking ----------
+class Stats {
+  constructor() { this.fpsAccum = 0; this.fpsTimer = 0; this.totalProbeUpdates = 0; }
+  tick(dt) {
+    this.fpsAccum++;
+    this.fpsTimer += dt;
+    if (this.fpsTimer >= 0.5) {
+      fpsEl.textContent = Math.round(this.fpsAccum / this.fpsTimer);
+      updateCountEl.textContent = this.totalProbeUpdates.toLocaleString();
+      this.fpsAccum = 0; this.fpsTimer = 0;
+    }
+  }
+}
+
+// ============================================================
+// WebGPU scene — minimal rebuild. Phase 2 of incremental rebuild.
+// Just renderer + Cornell box + direct lighting. No probes, no GI yet.
+// We add features in subsequent phases once this is verified working.
+// ============================================================
+async function createWebGPUScene(canvas) {
+  if (!navigator.gpu) throw new Error('WebGPU not available in this browser.');
+
+  bc('createWebGPUScene start');
+
+  // Lazy-load WebGPU/TSL bundles
+  bc('loading three/webgpu + three/tsl…');
+  const { WebGPURenderer, MeshStandardNodeMaterial, MeshBasicNodeMaterial, TSL } = await loadWebGPUImports();
+  bc('imports loaded');
+
+  bc('constructing WebGPURenderer');
+  const renderer = new WebGPURenderer({ canvas, antialias: true });
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+  renderer.setSize(window.innerWidth, window.innerHeight);
+  renderer.outputColorSpace = THREE.SRGBColorSpace;
+  renderer.toneMapping = THREE.ACESFilmicToneMapping;
+  renderer.toneMappingExposure = 1.0;
+
+  bc('awaiting renderer.init()');
+  await renderer.init();
+  bc('renderer init done');
+
+  const scene = new THREE.Scene();
+  scene.background = new THREE.Color(0x000000);
+
+  const camera = new THREE.PerspectiveCamera(45, window.innerWidth/window.innerHeight, 0.05, 100);
+  camera.position.set(0, 1.0, 3.6);
+
+  const controls = new OrbitControls(camera, canvas);
+  controls.target.set(0, 1.0, 0);
+  controls.enableDamping = true;
+  controls.minDistance = 1.2;
+  controls.maxDistance = 8;
+
+  bc('building Cornell box');
+
+  const cornell = new THREE.Group();
+  scene.add(cornell);
+
+  const wallMat = (color) =>
+    new MeshStandardNodeMaterial({ color, roughness: 1.0, metalness: 0.0 });
+  const matWhite = wallMat(0xeeeeee);
+  const matRed   = wallMat(0xcc2828);
+  const matGreen = wallMat(0x28a828);
+
+  const makeQuad = (w,h,m) => new THREE.Mesh(new THREE.PlaneGeometry(w,h), m);
+  { const m = makeQuad(2*BOX.x, 2*BOX.z, matWhite); m.rotation.x = -Math.PI/2; cornell.add(m); }
+  { const m = makeQuad(2*BOX.x, 2*BOX.z, matWhite); m.rotation.x =  Math.PI/2; m.position.y = 2*BOX.y; cornell.add(m); }
+  { const m = makeQuad(2*BOX.x, 2*BOX.y, matWhite); m.position.set(0, BOX.y, -BOX.z); cornell.add(m); }
+  { const m = makeQuad(2*BOX.z, 2*BOX.y, matRed);   m.rotation.y =  Math.PI/2; m.position.set(-BOX.x, BOX.y, 0); cornell.add(m); }
+  { const m = makeQuad(2*BOX.z, 2*BOX.y, matGreen); m.rotation.y = -Math.PI/2; m.position.set( BOX.x, BOX.y, 0); cornell.add(m); }
+
+  // emissive ceiling panel
+  const lightPanelMat = new MeshBasicNodeMaterial({ color: 0xffffff });
+  // Try setting colorNode as a plain TSL vec3. This is one of the things we want to test.
+  try {
+    lightPanelMat.colorNode = TSL.vec3(8.0, 8.0, 7.0);
+    lightPanelMat.toneMapped = false;
+    bc('lightPanel.colorNode = vec3 OK');
+  } catch (e) {
+    bc('lightPanel.colorNode failed: ' + e.message);
+  }
+  const lightPanel = new THREE.Mesh(new THREE.PlaneGeometry(0.55, 0.45), lightPanelMat);
+  lightPanel.rotation.x = Math.PI/2;
+  lightPanel.position.set(0, 2*BOX.y - 0.001, 0);
+  cornell.add(lightPanel);
+
+  // direct lighting via point light (RectAreaLight + NodeMaterial is fragile in r172)
+  const keyLight = new THREE.PointLight(0xfff8e8, 18.0, 0, 1.4);
+  keyLight.position.set(0, 2*BOX.y - 0.05, 0);
+  scene.add(keyLight);
+
+  const tallBox = new THREE.Mesh(new THREE.BoxGeometry(0.55, 1.1, 0.55), matWhite);
+  tallBox.position.set(-0.3, 0.55, -0.3);
+  tallBox.rotation.y = THREE.MathUtils.degToRad(18);
+  cornell.add(tallBox);
+
+  const shortBox = new THREE.Mesh(new THREE.BoxGeometry(0.55, 0.55, 0.55), matWhite);
+  shortBox.position.set(0.32, 0.275, 0.28);
+  shortBox.rotation.y = THREE.MathUtils.degToRad(-18);
+  cornell.add(shortBox);
+
+  bc('Cornell box built');
+
+  // ---- SH DataTexture (Phase 4 prep) ----
+  // 9 columns × PROBE_COUNT rows, RGBA float. Each row holds one probe's 9 SH coeffs.
+  const SH_TEX_W = 9;
+  const probeSHData = new Float32Array(SH_TEX_W * PROBE_COUNT * 4);
+  const probeSHTex = new THREE.DataTexture(
+    probeSHData, SH_TEX_W, PROBE_COUNT, THREE.RGBAFormat, THREE.FloatType
+  );
+  probeSHTex.minFilter = THREE.NearestFilter;
+  probeSHTex.magFilter = THREE.NearestFilter;
+  probeSHTex.wrapS = THREE.ClampToEdgeWrapping;
+  probeSHTex.wrapT = THREE.ClampToEdgeWrapping;
+  probeSHTex.needsUpdate = true;
+
+  function uploadProbeSHToTex(idx, sh) {
+    const base = idx * SH_TEX_W * 4;
+    for (let k = 0; k < 9; k++) {
+      probeSHData[base + k*4 + 0] = sh[k].x;
+      probeSHData[base + k*4 + 1] = sh[k].y;
+      probeSHData[base + k*4 + 2] = sh[k].z;
+      probeSHData[base + k*4 + 3] = 1.0;
+    }
+    probeSHTex.needsUpdate = true;
+  }
+
+  // ---- TSL: GI sampling node graph (Phase 4) ----
+  bc('building TSL GI graph');
+  let giSampleFn = null;
+  let uGiEnabled = null, uGiIntensity = null;
+  let uProbeMin = null, uProbeMax = null, uProbeDims = null;
+  try {
+    const { Fn, vec2, vec3, float, uniform, texture, positionWorld, normalWorld } = TSL;
+    uProbeMin    = uniform(PROBE_MIN.clone());
+    uProbeMax    = uniform(PROBE_MAX.clone());
+    uProbeDims   = uniform(PROBE_DIMS.clone());
+    uGiIntensity = uniform(1.0);
+    uGiEnabled   = uniform(1.0);
+
+    // Read SH coefficient k for probe pi (pi is a float node)
+    const readSH = (probeIdxFloat, k) => {
+      const u = float((k + 0.5) / 9.0);
+      const v = probeIdxFloat.add(0.5).div(float(PROBE_COUNT));
+      return texture(probeSHTex, vec2(u, v));
+    };
+
+    // Standard L2 SH evaluation in direction n, for probe pi
+    const evalSH = (n, probeIdxFloat) => {
+      const x = n.x, y = n.y, z = n.z;
+      const c0 = readSH(probeIdxFloat, 0);
+      const c1 = readSH(probeIdxFloat, 1);
+      const c2 = readSH(probeIdxFloat, 2);
+      const c3 = readSH(probeIdxFloat, 3);
+      const c4 = readSH(probeIdxFloat, 4);
+      const c5 = readSH(probeIdxFloat, 5);
+      const c6 = readSH(probeIdxFloat, 6);
+      const c7 = readSH(probeIdxFloat, 7);
+      const c8 = readSH(probeIdxFloat, 8);
+      return c0.mul(0.886227)
+        .add(c1.mul(2.0 * 0.511664).mul(y))
+        .add(c2.mul(2.0 * 0.511664).mul(z))
+        .add(c3.mul(2.0 * 0.511664).mul(x))
+        .add(c4.mul(2.0 * 0.429043).mul(x).mul(y))
+        .add(c5.mul(2.0 * 0.429043).mul(y).mul(z))
+        .add(c6.mul(z.mul(z).mul(0.743125).sub(0.247708)))
+        .add(c7.mul(2.0 * 0.429043).mul(x).mul(z))
+        .add(c8.mul(0.429043).mul(x.mul(x).sub(y.mul(y))));
+    };
+
+    // Trilinear blend across 8 surrounding probes
+    giSampleFn = Fn(([wp, n]) => {
+      const grid = wp.sub(uProbeMin).div(uProbeMax.sub(uProbeMin))
+                   .clamp(vec3(0.0), vec3(1.0))
+                   .mul(uProbeDims.sub(vec3(1.0)));
+      const baseIdx = grid.floor();
+      const frac    = grid.sub(baseIdx);
+
+      let sum  = vec3(0.0).toVar();
+      let wSum = float(0.0).toVar();
+
+      for (let i = 0; i < 8; i++) {
+        const dx = i & 1, dy = (i >> 1) & 1, dz = (i >> 2) & 1;
+        const offset = vec3(float(dx), float(dy), float(dz));
+        const idx = baseIdx.add(offset).clamp(vec3(0.0), uProbeDims.sub(vec3(1.0)));
+        const wAxis = vec3(float(1.0)).sub(frac).mix(frac, offset);
+        const weight = wAxis.x.mul(wAxis.y).mul(wAxis.z).max(float(0.0005));
+        const pi = idx.x.add(idx.y.mul(uProbeDims.x)).add(idx.z.mul(uProbeDims.x).mul(uProbeDims.y));
+        const irr = evalSH(n, pi);
+        sum  = sum.add(irr.rgb.mul(weight));
+        wSum = wSum.add(weight);
+      }
+      return sum.div(wSum.max(float(1e-4)));
+    });
+
+    bc('TSL GI graph built');
+
+    // Wire GI into material emissive (Lambertian indirect: albedo/π × irradiance)
+    // Phase 4a step 1: verify emissiveNode plumbing first with a TINY constant tint
+    // (toggle via uGiEnabled); then we can A/B against the real GI math at runtime.
+    for (const m of [matWhite, matRed, matGreen]) {
+      const albedoVec = new THREE.Vector3(m.color.r, m.color.g, m.color.b);
+      const albedoU = uniform(albedoVec);
+      const giRaw = giSampleFn(positionWorld, normalWorld.normalize());
+      const gi = giRaw.max(vec3(0.0));
+      const lambertian = gi.mul(albedoU).mul(1.0 / Math.PI);
+      // small probe of plumbing: a constant orange tint we can see if everything else fails
+      const fallbackEmissive = vec3(0.05, 0.025, 0.0);
+      m.emissiveNode = lambertian.mul(uGiEnabled).mul(uGiIntensity).add(fallbackEmissive);
+    }
+    bc('emissiveNode wired on 3 wall materials');
+  } catch (e) {
+    bc('TSL graph FAILED: ' + e.message);
+    console.error('TSL graph build failed', e);
+  }
+
+  // ---- Probe Grid + capture (Phase 3) ----
+  bc('building probe grid');
+  const probePositions = [];
+  const probeRadianceRT = [];
+  const cubeCameras = [];
+  // probe SH stored as Vector3[9] per probe
+  const probesSH = [];
+
+  for (let z=0; z<PROBE_DIMS.z; z++) for (let y=0; y<PROBE_DIMS.y; y++) for (let x=0; x<PROBE_DIMS.x; x++) {
+    const p = new THREE.Vector3(
+      THREE.MathUtils.lerp(PROBE_MIN.x, PROBE_MAX.x, x/(PROBE_DIMS.x-1)),
+      THREE.MathUtils.lerp(PROBE_MIN.y, PROBE_MAX.y, y/(PROBE_DIMS.y-1)),
+      THREE.MathUtils.lerp(PROBE_MIN.z, PROBE_MAX.z, z/(PROBE_DIMS.z-1))
+    );
+    probePositions.push(p);
+    const rt = new THREE.WebGLCubeRenderTarget(16, {
+      format: THREE.RGBAFormat, type: THREE.HalfFloatType,
+      generateMipmaps: false, colorSpace: THREE.LinearSRGBColorSpace
+    });
+    probeRadianceRT.push(rt);
+    const cam = new THREE.CubeCamera(0.01, 20, rt);
+    cam.position.copy(p);
+    scene.add(cam);
+    cubeCameras.push(cam);
+    const sh = []; for (let k=0; k<9; k++) sh.push(new THREE.Vector3());
+    probesSH.push(sh);
+  }
+  bc(`${PROBE_COUNT} probes initialised`);
+
+  // Debug visualisation: spheres at probe positions, colored by ambient SH band.
+  const debugProbeGroup = new THREE.Group();
+  debugProbeGroup.visible = false;
+  scene.add(debugProbeGroup);
+  const debugSpheres = [];
+  for (let i=0; i<PROBE_COUNT; i++) {
+    const m = new THREE.Mesh(
+      new THREE.SphereGeometry(0.04, 12, 8),
+      new MeshBasicNodeMaterial({ color: 0x222222 })
+    );
+    m.position.copy(probePositions[i]);
+    debugProbeGroup.add(m);
+    debugSpheres.push(m);
+  }
+
+  // SH integration helpers (pure JS, no TSL involvement)
+  const FACE_SIZE = 16;
+  const COS_BAND = [Math.PI, 2*Math.PI/3, 2*Math.PI/3, 2*Math.PI/3,
+                    Math.PI/4, Math.PI/4, Math.PI/4, Math.PI/4, Math.PI/4];
+  const FACE_DIRS = [];
+  for (let f=0; f<6; f++) {
+    const arr = [];
+    for (let v=0; v<FACE_SIZE; v++) for (let u=0; u<FACE_SIZE; u++) {
+      const fu = (u + 0.5) / FACE_SIZE * 2 - 1;
+      const fv = (v + 0.5) / FACE_SIZE * 2 - 1;
+      let xx,yy,zz;
+      switch(f) {
+        case 0: xx = 1; yy =-fv; zz =-fu; break;
+        case 1: xx =-1; yy =-fv; zz = fu; break;
+        case 2: xx = fu; yy = 1; zz = fv; break;
+        case 3: xx = fu; yy =-1; zz =-fv; break;
+        case 4: xx = fu; yy =-fv; zz = 1; break;
+        case 5: xx =-fu; yy =-fv; zz =-1; break;
+      }
+      const len = Math.sqrt(xx*xx+yy*yy+zz*zz);
+      arr.push({ x: xx/len, y: yy/len, z: zz/len, w: 4 / ((1 + fu*fu + fv*fv) * len) });
+    }
+    FACE_DIRS.push(arr);
+  }
+  function f16ToF32(h) {
+    const s = (h & 0x8000) >> 15, e = (h & 0x7C00) >> 10, ff = h & 0x03FF;
+    if (e === 0) return (s ? -1 : 1) * Math.pow(2, -14) * (ff / 1024);
+    if (e === 0x1F) return ff ? NaN : ((s ? -1 : 1) * Infinity);
+    return (s ? -1 : 1) * Math.pow(2, e - 15) * (1 + ff / 1024);
+  }
+  function shBasis(d) {
+    const xx=d.x, yy=d.y, zz=d.z;
+    return [0.282095, -0.488603*yy, 0.488603*zz, -0.488603*xx,
+            1.092548*xx*yy, -1.092548*yy*zz, 0.315392*(3*zz*zz-1),
+            -1.092548*xx*zz, 0.546274*(xx*xx-yy*yy)];
+  }
+
+  async function readCubeFace(rt, face) {
+    // r172 WebGPURenderer signature: readRenderTargetPixelsAsync(target, x, y, w, h, textureIndex, faceIndex)
+    // textureIndex = 0 (single-target RT), faceIndex = 0..5 for cube faces
+    const data = await renderer.readRenderTargetPixelsAsync(rt, 0, 0, FACE_SIZE, FACE_SIZE, 0, face);
+    return data;
+  }
+
+  async function integrateSH(rt) {
+    const sh = []; for (let k=0; k<9; k++) sh.push({x:0,y:0,z:0});
+    // parallel face readback
+    const allFaces = await Promise.all([0,1,2,3,4,5].map(f => readCubeFace(rt, f)));
+    for (let f=0; f<6; f++) {
+      const data = allFaces[f];
+      // could be Uint16Array (half-float) or Float32Array; sniff
+      const isHalf = data instanceof Uint16Array;
+      const dirs = FACE_DIRS[f];
+      for (let i=0; i<FACE_SIZE*FACE_SIZE; i++) {
+        const r = isHalf ? f16ToF32(data[i*4+0]) : data[i*4+0];
+        const g = isHalf ? f16ToF32(data[i*4+1]) : data[i*4+1];
+        const b = isHalf ? f16ToF32(data[i*4+2]) : data[i*4+2];
+        const d = dirs[i];
+        const basis = shBasis(d);
+        for (let k=0; k<9; k++) {
+          const w = basis[k] * d.w;
+          sh[k].x += r * w;
+          sh[k].y += g * w;
+          sh[k].z += b * w;
+        }
+      }
+    }
+    for (let k=0; k<9; k++) {
+      sh[k].x *= COS_BAND[k];
+      sh[k].y *= COS_BAND[k];
+      sh[k].z *= COS_BAND[k];
+    }
+    return sh;
+  }
+
+  // declare stats early so updateOneProbe (called during priming, before render loop) can use it
+  const stats = new Stats();
+  let nextProbeToUpdate = 0;
+  let probeUpdateInFlight = false;
+  async function updateOneProbe() {
+    if (probeUpdateInFlight) return;
+    probeUpdateInFlight = true;
+    try {
+      const idx = nextProbeToUpdate;
+      const cam = cubeCameras[idx];
+      cam.position.copy(probePositions[idx]);
+      const wasDebug = debugProbeGroup.visible;
+      debugProbeGroup.visible = false;
+      const oldTM = renderer.toneMapping;
+      renderer.toneMapping = THREE.NoToneMapping;
+      cam.update(renderer, scene);
+      renderer.toneMapping = oldTM;
+      debugProbeGroup.visible = wasDebug;
+
+      try {
+        const sh = await integrateSH(probeRadianceRT[idx]);
+        for (let k=0; k<9; k++) probesSH[idx][k].set(sh[k].x, sh[k].y, sh[k].z);
+        uploadProbeSHToTex(idx, sh);
+        // debug sphere color = ambient SH band
+        const sc = 1.0/3.5449;
+        const c = sh[0];
+        debugSpheres[idx].material.color.setRGB(
+          Math.max(0, Math.min(1, c.x * sc)),
+          Math.max(0, Math.min(1, c.y * sc)),
+          Math.max(0, Math.min(1, c.z * sc))
+        );
+        stats.totalProbeUpdates++;
+      } catch (e) {
+        console.warn(`Probe ${idx} integration failed:`, e.message, e.stack);
+        if (idx === 0) bc('integrateSH failed: ' + e.message);
+      }
+
+      nextProbeToUpdate = (nextProbeToUpdate + 1) % PROBE_COUNT;
+    } finally {
+      probeUpdateInFlight = false;
+    }
+  }
+
+  // priming pass — capture all probes once before showing scene
+  bc('priming probes…');
+  for (let i = 0; i < PROBE_COUNT; i++) {
+    await updateOneProbe();
+    if ((i & 7) === 0) bc(`probe ${i}/${PROBE_COUNT}`);
+  }
+  bc('priming complete');
+
+  // ---- GUI ----
+  const params = {
+    exposure: 1.0,
+    showProbes: false,
+    giEnabled: true,
+    giIntensity: 1.0,
+  };
+  const gui = new GUI({ title: 'DDGI · WebGPU (with GI)', width: 280 });
+  if (uGiEnabled)   gui.add(params, 'giEnabled').name('GI enabled').onChange(v => uGiEnabled.value = v ? 1 : 0);
+  if (uGiIntensity) gui.add(params, 'giIntensity', 0, 3, 0.05).name('GI intensity').onChange(v => uGiIntensity.value = v);
+  gui.add(params, 'showProbes').name('Show probes').onChange(v => debugProbeGroup.visible = v);
+  gui.add(params, 'exposure', 0.2, 2.0, 0.05).name('Exposure').onChange(v => renderer.toneMappingExposure = v);
+
+  // ---- render loop ----
+  const clock = new THREE.Clock();
+  let rafId;
+  let stopped = false;
+  let firstFrame = true;
+  let asyncTimer = 0;
+  async function tick() {
+    if (stopped) return;
+    const dt = clock.getDelta();
+    controls.update();
+    asyncTimer += dt;
+    if (asyncTimer > 0.05) {
+      asyncTimer = 0;
+      updateOneProbe(); // fire-and-forget
+    }
+    try {
+      await renderer.renderAsync(scene, camera);
+      if (firstFrame) {
+        firstFrame = false;
+        bc('first renderAsync OK');
+      }
+    } catch (e) {
+      stopped = true;
+      console.error('renderAsync failed', e);
+      statusEl.classList.add('show');
+      statusEl.innerHTML = `<span class="err"><b>Render failed</b><br><span style="font-family:monospace;font-size:11px">${e.message || e}</span></span>`;
+      return;
+    }
+    stats.tick(dt);
+    if (!stopped) rafId = requestAnimationFrame(tick);
+  }
+  bc('starting render loop');
+  tick();
+
+  const onResize = () => {
+    camera.aspect = window.innerWidth / window.innerHeight;
+    camera.updateProjectionMatrix();
+    renderer.setSize(window.innerWidth, window.innerHeight);
+  };
+  window.addEventListener('resize', onResize);
+
+  bc('createWebGPUScene done');
+
+  return {
+    dispose() {
+      stopped = true;
+      cancelAnimationFrame(rafId);
+      window.removeEventListener('resize', onResize);
+      gui.destroy();
+      controls.dispose();
+      probeRadianceRT.forEach(rt => rt.dispose());
+      scene.traverse(o => {
+        if (o.geometry) o.geometry.dispose();
+        if (o.material) {
+          const ms = Array.isArray(o.material) ? o.material : [o.material];
+          ms.forEach(m => m.dispose());
+        }
+      });
+      renderer.dispose();
+    }
+  };
+}
+
+// ============================================================
+// WebGL scene — original implementation with onBeforeCompile patches
+// ============================================================
+async function createWebGLScene(canvas) {
+  const renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+  renderer.setSize(window.innerWidth, window.innerHeight);
+  renderer.outputColorSpace = THREE.SRGBColorSpace;
+  renderer.toneMapping = THREE.ACESFilmicToneMapping;
+  renderer.toneMappingExposure = 1.0;
+
+  RectAreaLightUniformsLib.init();
+
+  const scene = new THREE.Scene();
+  scene.background = new THREE.Color(0x000000);
+
+  const camera = new THREE.PerspectiveCamera(45, window.innerWidth/window.innerHeight, 0.05, 100);
+  camera.position.set(0, 1.0, 3.6);
+
+  const controls = new OrbitControls(camera, renderer.domElement);
+  controls.target.set(0, 1.0, 0);
+  controls.enableDamping = true;
+  controls.minDistance = 1.2;
+  controls.maxDistance = 8;
+
+  // ---- Cornell Box ----
+  const cornell = new THREE.Group();
+  scene.add(cornell);
+
+  const wallMat = (color) => new THREE.MeshStandardMaterial({ color, roughness: 1.0, metalness: 0.0 });
+  const matWhite = wallMat(0xeeeeee);
+  const matRed   = wallMat(0xcc2828);
+  const matGreen = wallMat(0x28a828);
+
+  const makeQuad = (w,h,m) => new THREE.Mesh(new THREE.PlaneGeometry(w,h), m);
+  { const m = makeQuad(2*BOX.x, 2*BOX.z, matWhite); m.rotation.x = -Math.PI/2; cornell.add(m); }
+  { const m = makeQuad(2*BOX.x, 2*BOX.z, matWhite); m.rotation.x =  Math.PI/2; m.position.y = 2*BOX.y; cornell.add(m); }
+  { const m = makeQuad(2*BOX.x, 2*BOX.y, matWhite); m.position.set(0, BOX.y, -BOX.z); cornell.add(m); }
+  { const m = makeQuad(2*BOX.z, 2*BOX.y, matRed);   m.rotation.y =  Math.PI/2; m.position.set(-BOX.x, BOX.y, 0); cornell.add(m); }
+  { const m = makeQuad(2*BOX.z, 2*BOX.y, matGreen); m.rotation.y = -Math.PI/2; m.position.set( BOX.x, BOX.y, 0); cornell.add(m); }
+
+  const lightPanel = new THREE.Mesh(new THREE.PlaneGeometry(0.55, 0.45),
+    new THREE.MeshBasicMaterial({ color: 0xffffff }));
+  lightPanel.material.color.setRGB(8, 8, 7);
+  lightPanel.rotation.x = Math.PI/2;
+  lightPanel.position.set(0, 2*BOX.y - 0.001, 0);
+  cornell.add(lightPanel);
+
+  const rectLight = new THREE.RectAreaLight(0xffffff, 18, 0.55, 0.45);
+  rectLight.position.set(0, 2*BOX.y - 0.005, 0);
+  rectLight.lookAt(0, 0, 0);
+  scene.add(rectLight);
+
+  const tallBox = new THREE.Mesh(new THREE.BoxGeometry(0.55, 1.1, 0.55), matWhite);
+  tallBox.position.set(-0.3, 0.55, -0.3);
+  tallBox.rotation.y = THREE.MathUtils.degToRad(18);
+  cornell.add(tallBox);
+
+  const shortBox = new THREE.Mesh(new THREE.BoxGeometry(0.55, 0.55, 0.55), matWhite);
+  shortBox.position.set(0.32, 0.275, 0.28);
+  shortBox.rotation.y = THREE.MathUtils.degToRad(-18);
+  cornell.add(shortBox);
+
+  const moverMat = new THREE.MeshStandardMaterial({
+    color: 0xff8a00, emissive: 0xff8a00, emissiveIntensity: 0.6,
+    roughness: 0.4, metalness: 0.0
+  });
+  const mover = new THREE.Mesh(new THREE.SphereGeometry(0.13, 32, 24), moverMat);
+  mover.position.set(0, 1.0, 0.4);
+  cornell.add(mover);
+
+  // ---- Probes ----
+  const probes = [];
+  const probePositions = [];
+  const probeRTs = [];
+  const cubeCameras = [];
+  for (let z=0; z<PROBE_DIMS.z; z++) for (let y=0; y<PROBE_DIMS.y; y++) for (let x=0; x<PROBE_DIMS.x; x++) {
+    const p = new THREE.Vector3(
+      THREE.MathUtils.lerp(PROBE_MIN.x, PROBE_MAX.x, x/(PROBE_DIMS.x-1)),
+      THREE.MathUtils.lerp(PROBE_MIN.y, PROBE_MAX.y, y/(PROBE_DIMS.y-1)),
+      THREE.MathUtils.lerp(PROBE_MIN.z, PROBE_MAX.z, z/(PROBE_DIMS.z-1))
+    );
+    probePositions.push(p);
+    const rt = new THREE.WebGLCubeRenderTarget(16, {
+      format: THREE.RGBAFormat, type: THREE.HalfFloatType,
+      generateMipmaps: false, colorSpace: THREE.LinearSRGBColorSpace
+    });
+    probeRTs.push(rt);
+    const cam = new THREE.CubeCamera(0.01, 20, rt);
+    cam.position.copy(p);
+    scene.add(cam);
+    cubeCameras.push(cam);
+    // Store SH as raw Vector3[9] — no LightProbe wrapper to avoid version churn
+    const probeSH = [];
+    for (let k=0; k<9; k++) probeSH.push(new THREE.Vector3());
+    probes.push(probeSH);
+  }
+
+  // debug spheres
+  const debugProbeGroup = new THREE.Group();
+  debugProbeGroup.visible = false;
+  scene.add(debugProbeGroup);
+  const debugSpheres = [];
+  for (let i=0; i<PROBE_COUNT; i++) {
+    const m = new THREE.Mesh(new THREE.SphereGeometry(0.04, 12, 8),
+      new THREE.MeshBasicMaterial({ color: 0x222222 }));
+    m.position.copy(probePositions[i]);
+    debugProbeGroup.add(m);
+    debugSpheres.push(m);
+  }
+
+  // SH coefficient buffer
+  const SH_COEFFS = 9;
+  const probeSHBuffer = new Array(PROBE_COUNT * SH_COEFFS);
+  for (let i=0; i<probeSHBuffer.length; i++) probeSHBuffer[i] = new THREE.Vector3();
+
+  function uploadProbeSH(i) {
+    const sh = probes[i]; // Vector3[9]
+    const base = i * SH_COEFFS;
+    for (let k=0; k<9; k++) probeSHBuffer[base+k].copy(sh[k]);
+    const c = debugSpheres[i].material.color;
+    const sc = 1.0/3.5449;
+    c.setRGB(
+      Math.max(0, Math.min(1, sh[0].x * sc)),
+      Math.max(0, Math.min(1, sh[0].y * sc)),
+      Math.max(0, Math.min(1, sh[0].z * sc))
+    );
+  }
+
+  // GI uniforms (shared across all patched materials)
+  const giUniforms = {
+    uProbeSH:     { value: probeSHBuffer },
+    uProbeMin:    { value: PROBE_MIN.clone() },
+    uProbeMax:    { value: PROBE_MAX.clone() },
+    uProbeDims:   { value: PROBE_DIMS.clone() },
+    uGiIntensity: { value: 1.0 },
+    uGiEnabled:   { value: 1.0 },
+  };
+
+  const giVertexInject = `
+varying vec3 vGiWorldPos;
+varying vec3 vGiWorldNormal;
+`;
+  const giVertexEnd = `
+vGiWorldPos    = ( modelMatrix * vec4( transformed, 1.0 ) ).xyz;
+vGiWorldNormal = normalize( ( modelMatrix * vec4( objectNormal, 0.0 ) ).xyz );
+`;
+  const giFragmentInject = `
+#define DDGI_PROBE_SH_COUNT ${PROBE_COUNT * 9}
+uniform vec3  uProbeSH[ DDGI_PROBE_SH_COUNT ];
+uniform vec3  uProbeMin;
+uniform vec3  uProbeMax;
+uniform vec3  uProbeDims;
+uniform float uGiIntensity;
+uniform float uGiEnabled;
+varying vec3  vGiWorldPos;
+varying vec3  vGiWorldNormal;
+
+vec3 ddgi_shIrradiance( vec3 n, int b ) {
+    float x = n.x, y = n.y, z = n.z;
+    vec3 r  = uProbeSH[ b + 0 ] * 0.886227;
+    r += uProbeSH[ b + 1 ] * 2.0 * 0.511664 * y;
+    r += uProbeSH[ b + 2 ] * 2.0 * 0.511664 * z;
+    r += uProbeSH[ b + 3 ] * 2.0 * 0.511664 * x;
+    r += uProbeSH[ b + 4 ] * 2.0 * 0.429043 * x * y;
+    r += uProbeSH[ b + 5 ] * 2.0 * 0.429043 * y * z;
+    r += uProbeSH[ b + 6 ] * ( 0.743125 * z * z - 0.247708 );
+    r += uProbeSH[ b + 7 ] * 2.0 * 0.429043 * x * z;
+    r += uProbeSH[ b + 8 ] * 0.429043 * ( x * x - y * y );
+    return r;
+}
+vec3 ddgi_sampleGrid( vec3 wp, vec3 n ) {
+    vec3 grid = ( wp - uProbeMin ) / ( uProbeMax - uProbeMin );
+    grid = clamp( grid, vec3(0.0), vec3(1.0) ) * ( uProbeDims - vec3(1.0) );
+    vec3 base = floor( grid );
+    vec3 frac = grid - base;
+    vec3 sum = vec3(0.0); float wSum = 0.0;
+    for ( int i = 0; i < 8; i++ ) {
+        vec3 d = vec3( float( i & 1 ), float( ( i >> 1 ) & 1 ), float( ( i >> 2 ) & 1 ) );
+        vec3 idx = clamp( base + d, vec3(0.0), uProbeDims - vec3(1.0) );
+        vec3 w = mix( vec3(1.0) - frac, frac, d );
+        float weight = max( w.x * w.y * w.z, 0.001 );
+        int pi = int( idx.x + idx.y * uProbeDims.x + idx.z * uProbeDims.x * uProbeDims.y );
+        sum  += weight * ddgi_shIrradiance( n, pi * 9 );
+        wSum += weight;
+    }
+    return sum / max( wSum, 1e-4 );
+}
+`;
+  function patchStandardMaterial(material) {
+    material.onBeforeCompile = (shader) => {
+      Object.assign(shader.uniforms, giUniforms);
+      shader.vertexShader = shader.vertexShader
+        .replace('#include <common>', '#include <common>\n' + giVertexInject)
+        .replace('#include <worldpos_vertex>', '#include <worldpos_vertex>\n' + giVertexEnd);
+      if (!shader.vertexShader.includes('vGiWorldPos    =')) {
+        shader.vertexShader = shader.vertexShader.replace(
+          '#include <project_vertex>',
+          giVertexEnd + '\n#include <project_vertex>'
+        );
+      }
+      shader.fragmentShader = shader.fragmentShader
+        .replace('#include <common>', '#include <common>\n' + giFragmentInject)
+        .replace('#include <lights_fragment_maps>', `
+          #include <lights_fragment_maps>
+          {
+            vec3 nGi = normalize( vGiWorldNormal );
+            vec3 gi = ddgi_sampleGrid( vGiWorldPos, nGi );
+            iblIrradiance += uGiEnabled * uGiIntensity * max( gi, vec3(0.0) );
+          }
+        `);
+    };
+    material.needsUpdate = true;
+  }
+  [matWhite, matRed, matGreen, moverMat].forEach(m => patchStandardMaterial(m));
+
+  // ---- Manual SH integration (bypasses LightProbeGenerator API churn) ----
+  const FACE_SIZE = 16;
+  const COS_BAND = [Math.PI, 2*Math.PI/3, 2*Math.PI/3, 2*Math.PI/3,
+                    Math.PI/4, Math.PI/4, Math.PI/4, Math.PI/4, Math.PI/4];
+  const FACE_DIRS = [];
+  function f16ToF32(h) {
+    const s = (h & 0x8000) >> 15, e = (h & 0x7C00) >> 10, f = h & 0x03FF;
+    if (e === 0) return (s ? -1 : 1) * Math.pow(2, -14) * (f / 1024);
+    if (e === 0x1F) return f ? NaN : ((s ? -1 : 1) * Infinity);
+    return (s ? -1 : 1) * Math.pow(2, e - 15) * (1 + f / 1024);
+  }
+  function shBasis(d) {
+    const x=d.x, y=d.y, z=d.z;
+    return [0.282095, -0.488603*y, 0.488603*z, -0.488603*x,
+            1.092548*x*y, -1.092548*y*z, 0.315392*(3*z*z-1),
+            -1.092548*x*z, 0.546274*(x*x-y*y)];
+  }
+  for (let f=0; f<6; f++) {
+    const arr = [];
+    for (let v=0; v<FACE_SIZE; v++) for (let u=0; u<FACE_SIZE; u++) {
+      const fu = (u + 0.5) / FACE_SIZE * 2 - 1;
+      const fv = (v + 0.5) / FACE_SIZE * 2 - 1;
+      let x,y,z;
+      switch(f) {
+        case 0: x = 1; y =-fv; z =-fu; break;
+        case 1: x =-1; y =-fv; z = fu; break;
+        case 2: x = fu; y = 1; z = fv; break;
+        case 3: x = fu; y =-1; z =-fv; break;
+        case 4: x = fu; y =-fv; z = 1; break;
+        case 5: x =-fu; y =-fv; z =-1; break;
+      }
+      const len = Math.sqrt(x*x+y*y+z*z);
+      arr.push({ x: x/len, y: y/len, z: z/len, w: 4 / ((1 + fu*fu + fv*fv) * len) });
+    }
+    FACE_DIRS.push(arr);
+  }
+
+  // probe capture
+  let nextProbeToUpdate = 0;
+  let probeUpdateInFlight = false;
+  const stats = new Stats();
+  const _shTmp = [];
+  for (let i=0; i<9; i++) _shTmp.push({x:0,y:0,z:0});
+
+  async function integrateRadianceSH(rt) {
+    for (let k=0; k<9; k++) { _shTmp[k].x = 0; _shTmp[k].y = 0; _shTmp[k].z = 0; }
+    for (let f=0; f<6; f++) {
+      const buf = new Uint16Array(FACE_SIZE * FACE_SIZE * 4);
+      // r172 WebGL signature: readRenderTargetPixels(rt, x, y, w, h, buffer, activeCubeFaceIndex)
+      await renderer.readRenderTargetPixelsAsync(rt, 0, 0, FACE_SIZE, FACE_SIZE, buf, f);
+      const dirs = FACE_DIRS[f];
+      for (let i=0; i<FACE_SIZE*FACE_SIZE; i++) {
+        const r = f16ToF32(buf[i*4+0]);
+        const g = f16ToF32(buf[i*4+1]);
+        const b = f16ToF32(buf[i*4+2]);
+        const d = dirs[i];
+        const basis = shBasis(d);
+        for (let k=0; k<9; k++) {
+          const w = basis[k] * d.w;
+          _shTmp[k].x += r * w;
+          _shTmp[k].y += g * w;
+          _shTmp[k].z += b * w;
+        }
+      }
+    }
+    // cosine convolution (Lambertian irradiance)
+    const out = [];
+    for (let k=0; k<9; k++) out.push({
+      x: _shTmp[k].x * COS_BAND[k],
+      y: _shTmp[k].y * COS_BAND[k],
+      z: _shTmp[k].z * COS_BAND[k],
+    });
+    return out;
+  }
+
+  async function updateProbes(count) {
+    if (probeUpdateInFlight) return;
+    probeUpdateInFlight = true;
+    try {
+      const wasDebug = debugProbeGroup.visible;
+      debugProbeGroup.visible = false;
+      const oldTM = renderer.toneMapping;
+      renderer.toneMapping = THREE.NoToneMapping;
+      for (let i=0; i<count; i++) {
+        const idx = nextProbeToUpdate;
+        const cam = cubeCameras[idx];
+        cam.position.copy(probePositions[idx]);
+        cam.update(renderer, scene);
+        try {
+          const sh = await integrateRadianceSH(probeRTs[idx]);
+          // store SH directly into Vector3[] for this probe
+          for (let k=0; k<9; k++) probes[idx][k].set(sh[k].x, sh[k].y, sh[k].z);
+          uploadProbeSH(idx);
+        } catch (e) {
+          console.warn(`Probe ${idx} integration failed:`, e.message);
+        }
+        nextProbeToUpdate = (nextProbeToUpdate + 1) % PROBE_COUNT;
+        stats.totalProbeUpdates++;
+      }
+      renderer.toneMapping = oldTM;
+      debugProbeGroup.visible = wasDebug;
+    } finally {
+      probeUpdateInFlight = false;
+    }
+  }
+  // priming pass (one full sweep — multi-bounce accumulates passively)
+  setStatus('Capturing probes…');
+  await updateProbes(PROBE_COUNT);
+  setStatus('');
+
+  // GUI
+  const params = {
+    giEnabled: true, giIntensity: 1.0, showProbes: false,
+    probesPerFrame: 4, moverActive: true, exposure: 1.0,
+  };
+  const gui = new GUI({ title: 'DDGI · WebGL', width: 280 });
+  gui.add(params, 'giEnabled').name('GI enabled').onChange(v => giUniforms.uGiEnabled.value = v ? 1 : 0);
+  gui.add(params, 'giIntensity', 0, 3, 0.05).name('GI intensity').onChange(v => giUniforms.uGiIntensity.value = v);
+  gui.add(params, 'showProbes').name('Show probes').onChange(v => debugProbeGroup.visible = v);
+  gui.add(params, 'probesPerFrame', 1, 16, 1).name('Probes / frame');
+  gui.add(params, 'moverActive').name('Animate mover');
+  gui.add(params, 'exposure', 0.2, 2.0, 0.05).name('Exposure').onChange(v => renderer.toneMappingExposure = v);
+  gui.add({ rebuild: () => updateProbes(PROBE_COUNT) }, 'rebuild').name('Full probe refresh');
+
+  const clock = new THREE.Clock();
+  let rafId;
+  let stopped = false;
+  function tick() {
+    if (stopped) return;
+    rafId = requestAnimationFrame(tick);
+    const dt = clock.getDelta(), t = clock.elapsedTime;
+    if (params.moverActive) {
+      mover.position.set(
+        Math.sin(t*0.7)*0.55,
+        0.65 + 0.25*Math.sin(t*1.1),
+        Math.cos(t*0.9)*0.55
+      );
+      const hue = (t*0.05) % 1.0;
+      moverMat.color.setHSL(hue, 0.85, 0.55);
+      moverMat.emissive.copy(moverMat.color);
+    }
+    // fire-and-forget — async, single-flight via probeUpdateInFlight
+    updateProbes(params.probesPerFrame).catch(e => console.warn('probe update', e));
+    controls.update();
+    renderer.render(scene, camera);
+    stats.tick(dt);
+  }
+  tick();
+
+  const onResize = () => {
+    camera.aspect = window.innerWidth / window.innerHeight;
+    camera.updateProjectionMatrix();
+    renderer.setSize(window.innerWidth, window.innerHeight);
+  };
+  window.addEventListener('resize', onResize);
+
+  return {
+    dispose() {
+      stopped = true;
+      cancelAnimationFrame(rafId);
+      window.removeEventListener('resize', onResize);
+      gui.destroy();
+      controls.dispose();
+      probeRTs.forEach(rt => rt.dispose());
+      scene.traverse(o => {
+        if (o.geometry) o.geometry.dispose();
+        if (o.material) {
+          const ms = Array.isArray(o.material) ? o.material : [o.material];
+          ms.forEach(m => m.dispose());
+        }
+      });
+      renderer.dispose();
+    }
+  };
+}
+
+// ---------- entry point ----------
+loadScene('webgl');
+
+</script>
+</body>
+</html>
+
