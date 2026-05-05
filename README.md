@@ -35,7 +35,7 @@ A single-page Three.js demo of probe-grid Dynamic Diffuse Global Illumination (D
 | 4a. emissiveNode plumbing | ✓ | Constant emissive (mode 1) verified via diagnostic selector |
 | 4b. SH data → shader (DataTexture) | ✗ | `texture(probeSHTex, ...)` returned vec3(0,0,0) — silent upload failure |
 | 4c. SH data → shader (uniformArray) | ✓ | `uniformArray(probeSHFlat, 'vec3').element(idx)` works; subtle but correct color bleed visible at wall/floor corners |
-| 5. Tune GI intensity to match WebGL | partial | Color bleed is subtle compared to WebGL; needs intensity scaling and possibly a multi-bounce priming pass |
+| 5. Tune GI intensity to match WebGL | runtime knobs | GI intensity slider widened to 0–15, default 3.0; `Apply 1/π factor` toggle (default OFF) lets the user A/B against the textbook Lambertian formulation. Math is identical to WebGL on paper; the brightness deficit appears to come from tone mapping being silently applied during WebGPU probe captures. |
 | 6. Depth-aware Chebyshev visibility | not started | The "real" DDGI correctness fix |
 
 ## The 5-phase diagnostic selector
@@ -63,6 +63,7 @@ This is what bisected the bug: mode 1 worked, mode 4 didn't — narrowing the fa
 4. **Temporal Dead Zone on `stats`.** A fire-and-forget probe update inside priming referenced a `const stats` declared later in the function, killing every probe's SH integration silently.
 5. **HDR emission via `MeshBasicNodeMaterial.colorNode`.** Setting `colorNode = vec3(8, 8, 7)` works only if you also set `material.toneMapped = false` to keep tone mapping out of it for the probe captures.
 6. **DataTexture upload to WebGPU.** `DataTexture(Float32Array, w, h, RGBAFormat, FloatType)` populated with SH coefficients, marked `needsUpdate = true` after each frame's CPU integration — never reaches the bind group from `texture(...)` in TSL. Returns `vec3(0)` to the shader. Workaround: keep the SH data as `Vector3[]` and expose via `uniformArray(arr, 'vec3').element(idx)` instead. 64 probes × 9 vec3 = 576 entries (≈6.75 KB) fits comfortably in WebGPU's uniform buffer limits.
+7. **Tone mapping during probe capture.** `renderer.toneMapping = NoToneMapping` is set before each `cubeCamera.update()` to keep HDR values intact (the ceiling panel emits at `8.0` linear). In WebGL this works — captures are linear-HDR. In WebGPU it appears the tone-mapping output node is part of compiled NodeMaterial pipelines and isn't toggled by the runtime change. The result: HDR `8.0` gets ACES-compressed to `~0.97` before the cube write, the SH integration sees a much darker scene, and the indirect contribution at runtime is roughly `1/π ≈ 3×` weaker than WebGL despite mathematically equivalent integration paths. The diagnostic confirmed this is *not* a doubled `1/π` factor — both backends produce `gi * albedo / π` on paper. The gap is in the captured `gi` value itself. Workaround for now: a wider intensity slider (0–15) and an "Apply 1/π factor" toggle in the GUI to dial in a value that matches the WebGL reference visually.
 
 ## Key architectural notes
 
