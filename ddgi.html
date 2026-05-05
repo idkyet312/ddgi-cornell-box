@@ -311,8 +311,17 @@ async function createWebGPUScene(canvas) {
   lightPanel.position.set(0, 2*BOX.y - 0.001, 0);
   cornell.add(lightPanel);
 
-  // direct lighting via point light (RectAreaLight + NodeMaterial is fragile in r172)
-  const keyLight = new THREE.PointLight(0xfff8e8, 18.0, 0, 1.4);
+  // Phase 5 calibration — direct lighting via point light (RectAreaLight + NodeMaterial
+  // is fragile in r172). The WebGL scene uses RectAreaLight(intensity=18) over a
+  // 0.55×0.45 panel, which radiates ~14 lm into the scene's hemisphere. A PointLight
+  // emitting omnidirectionally at the same intensity puts ~4π× more flux into the
+  // scene and ~8× more flux into the relevant hemisphere — so the same nominal
+  // intensity drives probes to multi-bounce-saturate (white walls clip, magenta SH
+  // artifacts where probes inside boxes contribute large mismatched values).
+  // Compensate by reducing PointLight intensity to a value that approximates the
+  // RectAreaLight's hemispherical flux. 2.5 was tuned empirically against the WebGL
+  // reference at intensity 1.0 with /π applied.
+  const keyLight = new THREE.PointLight(0xfff8e8, 2.5, 0, 1.4);
   keyLight.position.set(0, 2*BOX.y - 0.05, 0);
   scene.add(keyLight);
 
