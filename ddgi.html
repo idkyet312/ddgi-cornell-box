@@ -363,10 +363,17 @@ async function createWebGPUScene(canvas) {
     uProbeMin    = uniform(PROBE_MIN.clone());
     uProbeMax    = uniform(PROBE_MAX.clone());
     uProbeDims   = uniform(PROBE_DIMS.clone());
-    uGiIntensity = uniform(3.0);             // boosted; tone mapping during capture compresses HDR
+    // Phase 5a — match WebGL math: WebGL adds gi to iblIrradiance, then the standard
+    // PBR shader multiplies by (diffuse / π) inside RE_IndirectDiffuse_Physical. So
+    // WebGL's effective contribution is `gi × albedo / π × giIntensity` with default
+    // intensity 1.0. We mirror that here by enabling the /π factor and using 1.0
+    // intensity by default. The capture-loss workaround (3.0 boost without /π) is
+    // replaced by Phase 5b's tone-mapping-bypass-during-capture, which fixes the
+    // radiance loss at its source instead of compensating downstream.
+    uGiIntensity = uniform(1.0);             // matches WebGL default
     uGiEnabled   = uniform(1.0);
     uGiMode      = uniform(5.0);             // full trilinear by default
-    uGiPiFactor  = uniform(0.0);             // 0 = no /π, 1 = with /π (toggle in GUI to A/B)
+    uGiPiFactor  = uniform(1.0);             // /π by default — matches WebGL Lambertian BRDF
 
     // SH coefficients exposed as TSL uniformArray of vec3 (length PROBE_COUNT * 9).
     const probeSHArray = uniformArray(probeSHFlat, 'vec3');
@@ -612,6 +619,16 @@ async function createWebGPUScene(canvas) {
   const stats = new Stats();
   let nextProbeToUpdate = 0;
   let probeUpdateInFlight = false;
+  // Materials whose tone mapping must be suppressed during cube-camera probe capture.
+  // In WebGPU r172, tone mapping is compiled into NodeMaterial shader graphs, so
+  // toggling `renderer.toneMapping = NoToneMapping` mid-frame does not always
+  // propagate to already-built materials — captures end up ACES-compressed,
+  // discarding ~3× of the HDR radiance from the emissive panel and any
+  // GI-emissive feedback. Forcing `material.toneMapped = false` per-material
+  // during capture guarantees the linear path. lightPanelMat is already configured
+  // with `toneMapped = false` at construction, so we only need the wall mats here.
+  const captureMats = [matWhite, matRed, matGreen];
+
   async function updateOneProbe() {
     if (probeUpdateInFlight) return;
     probeUpdateInFlight = true;
@@ -623,7 +640,13 @@ async function createWebGPUScene(canvas) {
       debugProbeGroup.visible = false;
       const oldTM = renderer.toneMapping;
       renderer.toneMapping = THREE.NoToneMapping;
+      // Phase 5b — bypass tone mapping at the material level (belt-and-braces with
+      // the renderer-level toggle above). Without this, the captured radiance is
+      // ACES-compressed, which is the root cause of the "subtle GI" symptom.
+      const oldToneMapped = captureMats.map(m => m.toneMapped);
+      for (const m of captureMats) m.toneMapped = false;
       cam.update(renderer, scene);
+      for (let i = 0; i < captureMats.length; i++) captureMats[i].toneMapped = oldToneMapped[i];
       renderer.toneMapping = oldTM;
       debugProbeGroup.visible = wasDebug;
 
@@ -651,11 +674,20 @@ async function createWebGPUScene(canvas) {
     }
   }
 
-  // priming pass — capture all probes once before showing scene
-  bc('priming probes…');
-  for (let i = 0; i < PROBE_COUNT; i++) {
-    await updateOneProbe();
-    if ((i & 7) === 0) bc(`probe ${i}/${PROBE_COUNT}`);
+  // Phase 5c — multi-bounce priming. WebGL's GI accumulates passively because
+  // probe captures see the patched-shader walls already lit by GI from the
+  // previous probe sweep. WebGPU's wall materials use `emissiveNode`, which is
+  // also visible to subsequent probe captures, so the same passive accumulation
+  // works — but only once probes have been swept multiple times. By running 3
+  // sweeps before the first visible frame, we present the user with multi-bounce
+  // GI immediately instead of single-bounce that gradually fills in.
+  const PRIMING_BOUNCES = 3;
+  bc(`priming probes (${PRIMING_BOUNCES} bounces)…`);
+  for (let bounce = 0; bounce < PRIMING_BOUNCES; bounce++) {
+    for (let i = 0; i < PROBE_COUNT; i++) {
+      await updateOneProbe();
+      if ((i & 15) === 0) bc(`bounce ${bounce + 1}/${PRIMING_BOUNCES}: probe ${i}/${PROBE_COUNT}`);
+    }
   }
   bc('priming complete');
 
@@ -673,8 +705,8 @@ async function createWebGPUScene(canvas) {
     exposure: 1.0,
     showProbes: false,
     giEnabled: true,
-    giIntensity: 3.0,
-    applyPiFactor: false,
+    giIntensity: 1.0,                  // Phase 5a — match WebGL default
+    applyPiFactor: true,               // Phase 5a — match WebGL Lambertian BRDF
   };
   const gui = new GUI({ title: 'DDGI · WebGPU (diagnostic)', width: 320 });
   if (uGiMode) gui.add(params, 'giMode', Object.keys(giModes)).name('GI phase').onChange(v => {
@@ -682,7 +714,8 @@ async function createWebGPUScene(canvas) {
     bc('GI phase → ' + v);
   });
   if (uGiEnabled)   gui.add(params, 'giEnabled').name('GI enabled').onChange(v => uGiEnabled.value = v ? 1 : 0);
-  if (uGiIntensity) gui.add(params, 'giIntensity', 0, 15, 0.05).name('GI intensity').onChange(v => uGiIntensity.value = v);
+  // Phase 5a — slider range matches the WebGL scene (0..3) for direct A/B comparison.
+  if (uGiIntensity) gui.add(params, 'giIntensity', 0, 3, 0.05).name('GI intensity').onChange(v => uGiIntensity.value = v);
   if (uGiPiFactor)  gui.add(params, 'applyPiFactor').name('Apply 1/π factor').onChange(v => uGiPiFactor.value = v ? 1 : 0);
   gui.add(params, 'showProbes').name('Show probes').onChange(v => debugProbeGroup.visible = v);
   gui.add(params, 'exposure', 0.2, 2.0, 0.05).name('Exposure').onChange(v => renderer.toneMappingExposure = v);
@@ -697,8 +730,11 @@ async function createWebGPUScene(canvas) {
     if (stopped) return;
     const dt = clock.getDelta();
     controls.update();
+    // Phase 5c — match WebGL's continuous-update cadence so post-priming changes
+    // (movers, lighting tweaks) propagate at similar speed. Single-flight
+    // protection inside updateOneProbe() limits actual concurrency.
     asyncTimer += dt;
-    if (asyncTimer > 0.05) {
+    if (asyncTimer > 0.016) {
       asyncTimer = 0;
       updateOneProbe(); // fire-and-forget
     }
