@@ -289,7 +289,24 @@ async function createWebGPUScene(canvas) {
   const matRed   = wallMat(0xcc2828);
   const matGreen = wallMat(0x28a828);
 
-  const makeQuad = (w,h,m) => new THREE.Mesh(new THREE.PlaneGeometry(w,h), m);
+  const WALL_SEGMENTS = 96;
+  const BOX_SEGMENTS = 28;
+  const makeQuad = (w,h,m) => new THREE.Mesh(new THREE.PlaneGeometry(w, h, WALL_SEGMENTS, WALL_SEGMENTS), m);
+  const boxWireframes = [];
+  const addBoxWireframe = (mesh) => {
+    const wireMat = new THREE.LineBasicMaterial({
+      color: 0x111111,
+      transparent: true,
+      opacity: 0.42,
+    });
+    wireMat.depthWrite = false;
+    const wire = new THREE.LineSegments(new THREE.WireframeGeometry(mesh.geometry), wireMat);
+    wire.scale.setScalar(1.003);
+    wire.visible = false;
+    wire.renderOrder = 2;
+    boxWireframes.push(wire);
+    mesh.add(wire);
+  };
   { const m = makeQuad(2*BOX.x, 2*BOX.z, matWhite); m.rotation.x = -Math.PI/2; cornell.add(m); }
   { const m = makeQuad(2*BOX.x, 2*BOX.z, matWhite); m.rotation.x =  Math.PI/2; m.position.y = 2*BOX.y; cornell.add(m); }
   { const m = makeQuad(2*BOX.x, 2*BOX.y, matWhite); m.position.set(0, BOX.y, -BOX.z); cornell.add(m); }
@@ -316,14 +333,16 @@ async function createWebGPUScene(canvas) {
   keyLight.position.set(0, 2*BOX.y - 0.05, 0);
   scene.add(keyLight);
 
-  const tallBox = new THREE.Mesh(new THREE.BoxGeometry(0.55, 1.1, 0.55), matWhite);
+  const tallBox = new THREE.Mesh(new THREE.BoxGeometry(0.55, 1.1, 0.55, BOX_SEGMENTS, BOX_SEGMENTS * 2, BOX_SEGMENTS), matWhite);
   tallBox.position.set(-0.3, 0.55, -0.3);
   tallBox.rotation.y = THREE.MathUtils.degToRad(18);
+  addBoxWireframe(tallBox);
   cornell.add(tallBox);
 
-  const shortBox = new THREE.Mesh(new THREE.BoxGeometry(0.55, 0.55, 0.55), matWhite);
+  const shortBox = new THREE.Mesh(new THREE.BoxGeometry(0.55, 0.55, 0.55, BOX_SEGMENTS, BOX_SEGMENTS, BOX_SEGMENTS), matWhite);
   shortBox.position.set(0.32, 0.275, 0.28);
   shortBox.rotation.y = THREE.MathUtils.degToRad(-18);
+  addBoxWireframe(shortBox);
   cornell.add(shortBox);
 
   bc('Cornell box built');
@@ -359,7 +378,7 @@ async function createWebGPUScene(canvas) {
 
   // Debug visualisation: spheres at probe positions, colored by ambient SH band.
   const debugProbeGroup = new THREE.Group();
-  debugProbeGroup.visible = true;
+  debugProbeGroup.visible = false;
   scene.add(debugProbeGroup);
   const debugSpheres = [];
   for (let i=0; i<PROBE_COUNT; i++) {
@@ -500,11 +519,13 @@ async function createWebGPUScene(canvas) {
   // ---- GUI ----
   const params = {
     exposure: 1.0,
-    showProbes: true,
+    showProbes: false,
+    boxWireframe: false,
   };
   const gui = new GUI({ title: 'DDGI · WebGPU (probes only)', width: 280 });
   gui.add(params, 'exposure', 0.2, 2.0, 0.05).name('Exposure').onChange(v => renderer.toneMappingExposure = v);
   gui.add(params, 'showProbes').name('Show probes').onChange(v => debugProbeGroup.visible = v);
+  gui.add(params, 'boxWireframe').name('Box wireframe').onChange(v => boxWireframes.forEach(w => w.visible = v));
 
   // ---- render loop ----
   const clock = new THREE.Clock();
@@ -622,14 +643,35 @@ async function createWebGLScene(canvas) {
   rectLight.lookAt(0, 0, 0);
   scene.add(rectLight);
 
-  const tallBox = new THREE.Mesh(new THREE.BoxGeometry(0.55, 1.1, 0.55), matWhite);
+  const BOX_SEGMENTS = 28;
+  const boxWireframes = [];
+  const addBoxWireframe = (mesh) => {
+    const wire = new THREE.LineSegments(
+      new THREE.WireframeGeometry(mesh.geometry),
+      new THREE.LineBasicMaterial({
+        color: 0x111111,
+        transparent: true,
+        opacity: 0.42,
+        depthWrite: false
+      })
+    );
+    wire.scale.setScalar(1.003);
+    wire.visible = false;
+    wire.renderOrder = 2;
+    boxWireframes.push(wire);
+    mesh.add(wire);
+  };
+
+  const tallBox = new THREE.Mesh(new THREE.BoxGeometry(0.55, 1.1, 0.55, BOX_SEGMENTS, BOX_SEGMENTS * 2, BOX_SEGMENTS), matWhite);
   tallBox.position.set(-0.3, 0.55, -0.3);
   tallBox.rotation.y = THREE.MathUtils.degToRad(18);
+  addBoxWireframe(tallBox);
   cornell.add(tallBox);
 
-  const shortBox = new THREE.Mesh(new THREE.BoxGeometry(0.55, 0.55, 0.55), matWhite);
+  const shortBox = new THREE.Mesh(new THREE.BoxGeometry(0.55, 0.55, 0.55, BOX_SEGMENTS, BOX_SEGMENTS, BOX_SEGMENTS), matWhite);
   shortBox.position.set(0.32, 0.275, 0.28);
   shortBox.rotation.y = THREE.MathUtils.degToRad(-18);
+  addBoxWireframe(shortBox);
   cornell.add(shortBox);
 
   const moverMat = new THREE.MeshStandardMaterial({
@@ -718,6 +760,10 @@ vGiWorldNormal = normalize( ( modelMatrix * vec4( objectNormal, 0.0 ) ).xyz );
 `;
   const giFragmentInject = `
 #define DDGI_PROBE_SH_COUNT ${PROBE_COUNT * 9}
+#define DDGI_PROBE_COUNT ${PROBE_COUNT}
+#define DDGI_PROBE_X ${PROBE_DIMS.x}
+#define DDGI_PROBE_Y ${PROBE_DIMS.y}
+#define DDGI_PROBE_Z ${PROBE_DIMS.z}
 uniform vec3  uProbeSH[ DDGI_PROBE_SH_COUNT ];
 uniform vec3  uProbeMin;
 uniform vec3  uProbeMax;
@@ -743,17 +789,22 @@ vec3 ddgi_shIrradiance( vec3 n, int b ) {
 vec3 ddgi_sampleGrid( vec3 wp, vec3 n ) {
     vec3 grid = ( wp - uProbeMin ) / ( uProbeMax - uProbeMin );
     grid = clamp( grid, vec3(0.0), vec3(1.0) ) * ( uProbeDims - vec3(1.0) );
-    vec3 base = floor( grid );
-    vec3 frac = grid - base;
+    const float kernelRadius = 2.35;
     vec3 sum = vec3(0.0); float wSum = 0.0;
-    for ( int i = 0; i < 8; i++ ) {
-        vec3 d = vec3( float( i & 1 ), float( ( i >> 1 ) & 1 ), float( ( i >> 2 ) & 1 ) );
-        vec3 idx = clamp( base + d, vec3(0.0), uProbeDims - vec3(1.0) );
-        vec3 w = mix( vec3(1.0) - frac, frac, d );
-        float weight = max( w.x * w.y * w.z, 0.001 );
-        int pi = int( idx.x + idx.y * uProbeDims.x + idx.z * uProbeDims.x * uProbeDims.y );
+    int pi = 0;
+    for ( int iz = 0; iz < DDGI_PROBE_Z; iz++ ) {
+    for ( int iy = 0; iy < DDGI_PROBE_Y; iy++ ) {
+    for ( int ix = 0; ix < DDGI_PROBE_X; ix++ ) {
+        vec3 idx = vec3( float(ix), float(iy), float(iz) );
+        vec3 d = grid - idx;
+        float q = clamp( dot( d, d ) / ( kernelRadius * kernelRadius ), 0.0, 1.0 );
+        float kernel = 1.0 - q;
+        float weight = kernel * kernel * ( 3.0 - 2.0 * kernel );
         sum  += weight * ddgi_shIrradiance( n, pi * 9 );
         wSum += weight;
+        pi++;
+    }
+    }
     }
     return sum / max( wSum, 1e-4 );
 }
@@ -897,13 +948,14 @@ vec3 ddgi_sampleGrid( vec3 wp, vec3 n ) {
 
   // GUI
   const params = {
-    giEnabled: true, giIntensity: 1.0, showProbes: false,
+    giEnabled: true, giIntensity: 1.0, showProbes: false, boxWireframe: false,
     probesPerFrame: 4, moverActive: true, exposure: 1.0,
   };
   const gui = new GUI({ title: 'DDGI · WebGL', width: 280 });
   gui.add(params, 'giEnabled').name('GI enabled').onChange(v => giUniforms.uGiEnabled.value = v ? 1 : 0);
   gui.add(params, 'giIntensity', 0, 3, 0.05).name('GI intensity').onChange(v => giUniforms.uGiIntensity.value = v);
   gui.add(params, 'showProbes').name('Show probes').onChange(v => debugProbeGroup.visible = v);
+  gui.add(params, 'boxWireframe').name('Box wireframe').onChange(v => boxWireframes.forEach(w => w.visible = v));
   gui.add(params, 'probesPerFrame', 1, 16, 1).name('Probes / frame');
   gui.add(params, 'moverActive').name('Animate mover');
   gui.add(params, 'exposure', 0.2, 2.0, 0.05).name('Exposure').onChange(v => renderer.toneMappingExposure = v);

@@ -1,0 +1,7 @@
+{
+  "name": "ddgi-cornell-box",
+  "private": true,
+  "scripts": {
+    "dev": "node dev-server.js"
+  }
+}

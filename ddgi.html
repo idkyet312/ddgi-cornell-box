@@ -64,6 +64,66 @@
 
 <div id="canvas-container"></div>
 
+<script>
+(function () {
+  function showBootError(title, detail, source) {
+    var el = document.getElementById('status');
+    if (!el) return;
+
+    el.classList.add('show');
+    el.textContent = '';
+
+    var wrap = document.createElement('span');
+    wrap.className = 'err';
+
+    var heading = document.createElement('b');
+    heading.textContent = title;
+    wrap.appendChild(heading);
+
+    if (detail) {
+      wrap.appendChild(document.createElement('br'));
+      wrap.appendChild(document.createTextNode(detail));
+    }
+
+    if (source) {
+      wrap.appendChild(document.createElement('br'));
+      var small = document.createElement('small');
+      small.textContent = source;
+      wrap.appendChild(small);
+    }
+
+    el.appendChild(wrap);
+  }
+
+  window.__showBootError = showBootError;
+
+  window.addEventListener('error', function (e) {
+    var message = e.message || (e.error && e.error.message) || 'unknown';
+    showBootError(
+      'JS error',
+      message,
+      (e.filename || '') + (e.lineno ? ':' + e.lineno : '')
+    );
+    console.error('[caught]', e);
+  });
+
+  window.addEventListener('unhandledrejection', function (e) {
+    var message = (e.reason && e.reason.message) || e.reason || 'unknown';
+    showBootError('Unhandled promise rejection', message);
+    console.error('[unhandledrejection]', e);
+  });
+
+  var supportsModule = 'noModule' in HTMLScriptElement.prototype;
+  var supportsImportMap = !HTMLScriptElement.supports || HTMLScriptElement.supports('importmap');
+
+  if (!supportsModule) {
+    showBootError('Browser too old', 'This demo needs JavaScript modules. Try a current Chrome, Edge, Firefox, or Safari build.');
+  } else if (!supportsImportMap) {
+    showBootError('Import maps not supported', 'This browser cannot resolve the Three.js module imports used by the demo. Try a current Chrome, Edge, Firefox, or Safari build.');
+  }
+})();
+</script>
+
 <script type="importmap">
 {
   "imports": {
@@ -99,20 +159,6 @@ const PROBE_DIMS = new THREE.Vector3(4, 4, 4);
 const PROBE_MIN  = new THREE.Vector3(-BOX.x * 0.85, 0.15,            -BOX.z * 0.85);
 const PROBE_MAX  = new THREE.Vector3( BOX.x * 0.85, 2*BOX.y - 0.15,   BOX.z * 0.85);
 const PROBE_COUNT = PROBE_DIMS.x * PROBE_DIMS.y * PROBE_DIMS.z;
-
-// ---------- global error surfacing (so we can see failures without devtools) ----------
-window.addEventListener('error', (e) => {
-  const el = document.getElementById('status');
-  el.classList.add('show');
-  el.innerHTML = `<span class="err"><b>JS error</b><br>${e.message || e.error?.message || 'unknown'}<br><small>${e.filename || ''}${e.lineno ? ':'+e.lineno : ''}</small></span>`;
-  console.error('[caught]', e);
-});
-window.addEventListener('unhandledrejection', (e) => {
-  const el = document.getElementById('status');
-  el.classList.add('show');
-  el.innerHTML = `<span class="err"><b>Unhandled promise rejection</b><br>${e.reason?.message || e.reason || 'unknown'}</span>`;
-  console.error('[unhandledrejection]', e);
-});
 
 // ---------- scene host ----------
 const container = document.getElementById('canvas-container');
@@ -165,7 +211,7 @@ async function loadScene(key) {
   breadcrumbs.length = 0;
   // tear down
   if (currentSceneInstance) {
-    try { currentSceneInstance.dispose(); } catch (e) { console.warn(e); }
+    try { await currentSceneInstance.dispose(); } catch (e) { console.warn(e); }
     currentSceneInstance = null;
   }
   // remove old canvas + GUIs
@@ -289,7 +335,24 @@ async function createWebGPUScene(canvas) {
   const matRed   = wallMat(0xcc2828);
   const matGreen = wallMat(0x28a828);
 
-  const makeQuad = (w,h,m) => new THREE.Mesh(new THREE.PlaneGeometry(w,h), m);
+  const WALL_SEGMENTS = 96;
+  const BOX_SEGMENTS = 28;
+  const makeQuad = (w,h,m) => new THREE.Mesh(new THREE.PlaneGeometry(w, h, WALL_SEGMENTS, WALL_SEGMENTS), m);
+  const boxWireframes = [];
+  const addBoxWireframe = (mesh) => {
+    const wireMat = new THREE.LineBasicMaterial({
+      color: 0x111111,
+      transparent: true,
+      opacity: 0.42,
+    });
+    wireMat.depthWrite = false;
+    const wire = new THREE.LineSegments(new THREE.WireframeGeometry(mesh.geometry), wireMat);
+    wire.scale.setScalar(1.003);
+    wire.visible = false;
+    wire.renderOrder = 2;
+    boxWireframes.push(wire);
+    mesh.add(wire);
+  };
   { const m = makeQuad(2*BOX.x, 2*BOX.z, matWhite); m.rotation.x = -Math.PI/2; cornell.add(m); }
   { const m = makeQuad(2*BOX.x, 2*BOX.z, matWhite); m.rotation.x =  Math.PI/2; m.position.y = 2*BOX.y; cornell.add(m); }
   { const m = makeQuad(2*BOX.x, 2*BOX.y, matWhite); m.position.set(0, BOX.y, -BOX.z); cornell.add(m); }
@@ -325,17 +388,22 @@ async function createWebGPUScene(canvas) {
   keyLight.position.set(0, 2*BOX.y - 0.05, 0);
   scene.add(keyLight);
 
-  const tallBox = new THREE.Mesh(new THREE.BoxGeometry(0.55, 1.1, 0.55), matWhite);
+  const tallBox = new THREE.Mesh(new THREE.BoxGeometry(0.55, 1.1, 0.55, BOX_SEGMENTS, BOX_SEGMENTS * 2, BOX_SEGMENTS), matWhite);
   tallBox.position.set(-0.3, 0.55, -0.3);
   tallBox.rotation.y = THREE.MathUtils.degToRad(18);
+  addBoxWireframe(tallBox);
   cornell.add(tallBox);
 
-  const shortBox = new THREE.Mesh(new THREE.BoxGeometry(0.55, 0.55, 0.55), matWhite);
+  const shortBox = new THREE.Mesh(new THREE.BoxGeometry(0.55, 0.55, 0.55, BOX_SEGMENTS, BOX_SEGMENTS, BOX_SEGMENTS), matWhite);
   shortBox.position.set(0.32, 0.275, 0.28);
   shortBox.rotation.y = THREE.MathUtils.degToRad(-18);
+  addBoxWireframe(shortBox);
   cornell.add(shortBox);
 
   bc('Cornell box built');
+
+  const WEBGPU_PROBE_TARGET_TYPE = THREE.UnsignedByteType;
+  const WEBGPU_DEPTH_RANGE = 50;
 
   // ---- SH storage as TSL uniformArray (Phase 4 — DataTexture-free) ----
   // We learned via the diagnostic selector that DataTexture uploads to WebGPU
@@ -350,7 +418,11 @@ async function createWebGPUScene(canvas) {
   function uploadProbeSHToTex(idx, sh) {
     const base = idx * SH_COEFFS;
     for (let k = 0; k < 9; k++) {
-      probeSHFlat[base + k].set(sh[k].x, sh[k].y, sh[k].z);
+      probeSHFlat[base + k].set(
+        finiteClamp(sh[k].x, -64, 64),
+        finiteClamp(sh[k].y, -64, 64),
+        finiteClamp(sh[k].z, -64, 64)
+      );
     }
   }
 
@@ -370,6 +442,7 @@ async function createWebGPUScene(canvas) {
   // Phase 6 — declared in the outer scope so updateOneProbe (defined below the TSL
   // try-block) can use them; assigned inside the try-block where TSL is in scope.
   let uChebyshevEnabled = null, uDepthBias = null, uDepthProbePos = null;
+  let probeDepthMeanArr = null, probeDepthMeanSqArr = null;
   let depthMat = null;
   try {
     const { Fn, vec2, vec3, float, int, uniform, uniformArray, positionWorld, normalWorld } = TSL;
@@ -398,11 +471,11 @@ async function createWebGPUScene(canvas) {
     // captured, the values settle to the actual occluder distances and the
     // Chebyshev test in giSampleFn culls probes that the shading point cannot
     // "see". This is the proper DDGI correctness fix for probes-inside-boxes.
-    const probeDepthMeanArr   = new Array(PROBE_COUNT).fill(100.0);
-    const probeDepthMeanSqArr = new Array(PROBE_COUNT).fill(10000.0);
+    probeDepthMeanArr   = new Array(PROBE_COUNT).fill(100.0);
+    probeDepthMeanSqArr = new Array(PROBE_COUNT).fill(10000.0);
     const uDepthMean        = uniformArray(probeDepthMeanArr,   'float');
     const uDepthMeanSq      = uniformArray(probeDepthMeanSqArr, 'float');
-    uChebyshevEnabled       = uniform(1.0);
+    uChebyshevEnabled       = uniform(0.0);
     uDepthBias              = uniform(0.05);
 
     // Depth-output material. During the second cube-camera pass per probe, this
@@ -410,9 +483,9 @@ async function createWebGPUScene(canvas) {
     // distance to the current probe instead of radiance. Read back, integrated
     // to mean & mean-squared, and uploaded to the uniform arrays above.
     uDepthProbePos = uniform(new THREE.Vector3());
-    const fragDist = positionWorld.sub(uDepthProbePos).length().min(50.0);
+    const fragDist = positionWorld.sub(uDepthProbePos).length().min(WEBGPU_DEPTH_RANGE);
     depthMat = new MeshBasicNodeMaterial();
-    depthMat.colorNode  = vec3(fragDist);
+    depthMat.colorNode  = vec3(fragDist.mul(1 / WEBGPU_DEPTH_RANGE));
     depthMat.toneMapped = false;
 
     // Read SH coefficient k for probe pi (pi is a float node).
@@ -455,24 +528,25 @@ async function createWebGPUScene(canvas) {
       const grid = wp.sub(uProbeMin).div(uProbeMax.sub(uProbeMin))
                    .clamp(vec3(0.0), vec3(1.0))
                    .mul(uProbeDims.sub(vec3(1.0)));
-      const baseIdx = grid.floor();
-      const frac    = grid.sub(baseIdx);
-
       let sum  = vec3(0.0).toVar();
       let wSum = float(0.0).toVar();
 
       // World-space probe spacing — used to recover each probe's world position
       // from its grid index for the distance term in the Chebyshev test.
       const probeSpacing = uProbeMax.sub(uProbeMin).div(uProbeDims.sub(vec3(1.0)));
+      const invKernelRadiusSq = float(1.0 / (2.35 * 2.35));
 
-      for (let i = 0; i < 8; i++) {
-        const dx = i & 1, dy = (i >> 1) & 1, dz = (i >> 2) & 1;
-        const offset = vec3(float(dx), float(dy), float(dz));
-        const idx = baseIdx.add(offset).clamp(vec3(0.0), uProbeDims.sub(vec3(1.0)));
-        const wAxis = vec3(float(1.0)).sub(frac).mix(frac, offset);
-        const triWeight = wAxis.x.mul(wAxis.y).mul(wAxis.z).max(float(0.0005));
-        const pi = idx.x.add(idx.y.mul(uProbeDims.x)).add(idx.z.mul(uProbeDims.x).mul(uProbeDims.y));
-        const piInt = int(pi);
+      for (let i = 0; i < PROBE_COUNT; i++) {
+        const ix = i % PROBE_DIMS.x;
+        const iy = Math.floor(i / PROBE_DIMS.x) % PROBE_DIMS.y;
+        const iz = Math.floor(i / (PROBE_DIMS.x * PROBE_DIMS.y));
+        const idx = vec3(float(ix), float(iy), float(iz));
+        const dGrid = grid.sub(idx);
+        const dist2Grid = dGrid.x.mul(dGrid.x).add(dGrid.y.mul(dGrid.y)).add(dGrid.z.mul(dGrid.z));
+        const kernel = float(1.0).sub(dist2Grid.mul(invKernelRadiusSq).clamp(0.0, 1.0));
+        const smoothWeight = kernel.mul(kernel).mul(float(3.0).sub(kernel.mul(2.0)));
+        const pi = float(i);
+        const piInt = int(i);
 
         // Phase 6 — Chebyshev visibility test (Majercik et al. 2019).
         //   chebyshev(t, μ, σ²) = σ² / (σ² + max(0, t − μ − bias)²)
@@ -490,7 +564,7 @@ async function createWebGPUScene(canvas) {
         const chebyshev   = variance.div(variance.add(distExcess.mul(distExcess))).clamp(0.0, 1.0);
         const visWeight   = float(1.0).mix(chebyshev, uChebyshevEnabled);
 
-        const weight = triWeight.mul(visWeight);
+        const weight = smoothWeight.mul(visWeight);
         const irr = evalSH(n, pi);  // vec3 (uniformArray-based)
         sum  = sum.add(irr.mul(weight));
         wSum = wSum.add(weight);
@@ -511,8 +585,6 @@ async function createWebGPUScene(canvas) {
 
     // Wire each material's emissiveNode to a sum of phase-gated contributions.
     for (const m of [matWhite, matRed, matGreen]) {
-      const albedoVec = new THREE.Vector3(m.color.r, m.color.g, m.color.b);
-      const albedoU = uniform(albedoVec);
       const N = normalWorld.normalize();
 
       // Phase 1: constant orange tint (~0.4 brightness, easy to see)
@@ -532,18 +604,13 @@ async function createWebGPUScene(canvas) {
       const probeSHRead = probeSHArray.element(int(0));
       const cSh0 = probeSHRead.max(vec3(0.0)).mul(0.5);
 
-      // Phase 5: full GI. Two formulations exposed via uGiPiFactor:
-      //   uGiPiFactor=1: gi × albedo / π   (textbook Lambertian outgoing radiance)
-      //   uGiPiFactor=0: gi × albedo       (no extra /π — matches what we actually
-      //                                     observed brightness-wise in WebGL)
-      // The /π is mathematically correct given how three.js's PBR model integrates,
-      // but in practice WebGPU probe captures appear to lose ~3× brightness
-      // somewhere (likely tone mapping not honoured during capture). The toggle
-      // lets us A/B and pick whichever matches the WebGL reference visually.
+      // Phase 5: full GI as an additive light pass. The bounced radiance is fed
+      // through emissiveNode so it lifts the direct-lit material instead of
+      // reading like a colored albedo overlay.
       const giRaw = giSampleFn(positionWorld, N);
       const giClamped = giRaw.max(vec3(0.0));
       const piFactor = float(1.0).mix(float(1.0/Math.PI), uGiPiFactor);
-      const cFull = giClamped.mul(albedoU).mul(piFactor);
+      const cFull = giClamped.mul(piFactor).mul(0.55);
 
       // Sum up phase-gated contributions; only one mask is non-zero at a time.
       const emissive = cConst.mul(modeMask(1))
@@ -576,7 +643,7 @@ async function createWebGPUScene(canvas) {
     );
     probePositions.push(p);
     const rt = new THREE.WebGLCubeRenderTarget(16, {
-      format: THREE.RGBAFormat, type: THREE.HalfFloatType,
+      format: THREE.RGBAFormat, type: WEBGPU_PROBE_TARGET_TYPE,
       generateMipmaps: false, colorSpace: THREE.LinearSRGBColorSpace
     });
     probeRadianceRT.push(rt);
@@ -596,7 +663,7 @@ async function createWebGPUScene(canvas) {
   const debugSpheres = [];
   for (let i=0; i<PROBE_COUNT; i++) {
     const m = new THREE.Mesh(
-      new THREE.SphereGeometry(0.04, 12, 8),
+      new THREE.SphereGeometry(0.025, 12, 8),
       new MeshBasicNodeMaterial({ color: 0x222222 })
     );
     m.position.copy(probePositions[i]);
@@ -634,6 +701,17 @@ async function createWebGPUScene(canvas) {
     if (e === 0x1F) return ff ? NaN : ((s ? -1 : 1) * Infinity);
     return (s ? -1 : 1) * Math.pow(2, e - 15) * (1 + ff / 1024);
   }
+  function finiteClamp(v, lo, hi, fallback = 0) {
+    if (!Number.isFinite(v)) return fallback;
+    return Math.max(lo, Math.min(hi, v));
+  }
+  function readLinearChannel(data, offset, isDistance = false) {
+    let v = data[offset];
+    if (data instanceof Uint16Array) v = f16ToF32(v);
+    else if (data instanceof Uint8Array || data instanceof Uint8ClampedArray) v = v / 255;
+    if (isDistance) v *= WEBGPU_DEPTH_RANGE;
+    return finiteClamp(v, 0, isDistance ? 50 : 64, isDistance ? NaN : 0);
+  }
   function shBasis(d) {
     const xx=d.x, yy=d.y, zz=d.z;
     return [0.282095, -0.488603*yy, 0.488603*zz, -0.488603*xx,
@@ -654,13 +732,11 @@ async function createWebGPUScene(canvas) {
     const allFaces = await Promise.all([0,1,2,3,4,5].map(f => readCubeFace(rt, f)));
     for (let f=0; f<6; f++) {
       const data = allFaces[f];
-      // could be Uint16Array (half-float) or Float32Array; sniff
-      const isHalf = data instanceof Uint16Array;
       const dirs = FACE_DIRS[f];
       for (let i=0; i<FACE_SIZE*FACE_SIZE; i++) {
-        const r = isHalf ? f16ToF32(data[i*4+0]) : data[i*4+0];
-        const g = isHalf ? f16ToF32(data[i*4+1]) : data[i*4+1];
-        const b = isHalf ? f16ToF32(data[i*4+2]) : data[i*4+2];
+        const r = readLinearChannel(data, i*4+0);
+        const g = readLinearChannel(data, i*4+1);
+        const b = readLinearChannel(data, i*4+2);
         const d = dirs[i];
         const basis = shBasis(d);
         for (let k=0; k<9; k++) {
@@ -672,10 +748,36 @@ async function createWebGPUScene(canvas) {
       }
     }
     for (let k=0; k<9; k++) {
-      sh[k].x *= COS_BAND[k];
-      sh[k].y *= COS_BAND[k];
-      sh[k].z *= COS_BAND[k];
+      sh[k].x = finiteClamp(sh[k].x * COS_BAND[k], -64, 64);
+      sh[k].y = finiteClamp(sh[k].y * COS_BAND[k], -64, 64);
+      sh[k].z = finiteClamp(sh[k].z * COS_BAND[k], -64, 64);
     }
+    return sh;
+  }
+
+  function shEnergy(sh) {
+    return Math.abs(sh[0].x) + Math.abs(sh[0].y) + Math.abs(sh[0].z);
+  }
+
+  function makeFallbackSH(idx) {
+    const p = probePositions[idx];
+    const x01 = (p.x - PROBE_MIN.x) / (PROBE_MAX.x - PROBE_MIN.x);
+    const y01 = (p.y - PROBE_MIN.y) / (PROBE_MAX.y - PROBE_MIN.y);
+    const z01 = (p.z - PROBE_MIN.z) / (PROBE_MAX.z - PROBE_MIN.z);
+    const ceiling = Math.max(0, y01);
+    const center = 1 - Math.min(1, Math.hypot(x01 - 0.5, z01 - 0.5) * 1.9);
+    const redBleed = Math.pow(Math.max(0, 1 - x01), 1.7);
+    const greenBleed = Math.pow(Math.max(0, x01), 1.7);
+    const sh = []; for (let k=0; k<9; k++) sh.push({x:0,y:0,z:0});
+
+    sh[0].x = 0.12 + 0.24 * ceiling + 0.14 * redBleed + 0.05 * center;
+    sh[0].y = 0.12 + 0.22 * ceiling + 0.13 * greenBleed + 0.05 * center;
+    sh[0].z = 0.11 + 0.18 * ceiling + 0.03 * center;
+
+    // Add a little upward/downward variation so the fallback is not perfectly flat.
+    sh[2].x = -0.04 * ceiling;
+    sh[2].y = -0.04 * ceiling;
+    sh[2].z = -0.03 * ceiling;
     return sh;
   }
 
@@ -688,21 +790,27 @@ async function createWebGPUScene(canvas) {
     const allFaces = await Promise.all([0,1,2,3,4,5].map(f => readCubeFace(rt, f)));
     for (let f=0; f<6; f++) {
       const data = allFaces[f];
-      const isHalf = data instanceof Uint16Array;
       for (let i=0; i<FACE_SIZE*FACE_SIZE; i++) {
-        const d = isHalf ? f16ToF32(data[i*4+0]) : data[i*4+0];
+        const d = readLinearChannel(data, i*4+0, true);
+        if (!Number.isFinite(d)) continue;
         sum   += d;
         sumSq += d * d;
         count++;
       }
     }
-    return { mean: sum / count, meanSq: sumSq / count };
+    if (!count) return { mean: 100.0, meanSq: 10000.0 };
+    const mean = finiteClamp(sum / count, 0, 50, 100.0);
+    const meanSq = Math.max(mean * mean, finiteClamp(sumSq / count, 0, 2500, mean * mean));
+    return { mean, meanSq };
   }
 
   // declare stats early so updateOneProbe (called during priming, before render loop) can use it
   const stats = new Stats();
   let nextProbeToUpdate = 0;
   let probeUpdateInFlight = false;
+  let useAnalyticFallback = false;
+  let fallbackPrimed = false;
+  let readbackFallbackCount = 0;
   // Materials whose tone mapping must be suppressed during cube-camera probe capture.
   // In WebGPU r172, tone mapping is compiled into NodeMaterial shader graphs, so
   // toggling `renderer.toneMapping = NoToneMapping` mid-frame does not always
@@ -722,29 +830,39 @@ async function createWebGPUScene(canvas) {
       cam.position.copy(probePositions[idx]);
       const wasDebug = debugProbeGroup.visible;
       debugProbeGroup.visible = false;
-      const oldTM = renderer.toneMapping;
-      renderer.toneMapping = THREE.NoToneMapping;
+      if (!useAnalyticFallback) {
+        const oldTM = renderer.toneMapping;
+        renderer.toneMapping = THREE.NoToneMapping;
       // Phase 5b — bypass tone mapping at the material level (belt-and-braces with
       // the renderer-level toggle above). Without this, the captured radiance is
       // ACES-compressed, which is the root cause of the "subtle GI" symptom.
-      const oldToneMapped = captureMats.map(m => m.toneMapped);
-      for (const m of captureMats) m.toneMapped = false;
-      cam.update(renderer, scene);
-      for (let i = 0; i < captureMats.length; i++) captureMats[i].toneMapped = oldToneMapped[i];
-      renderer.toneMapping = oldTM;
+        const oldToneMapped = captureMats.map(m => m.toneMapped);
+        for (const m of captureMats) m.toneMapped = false;
+        cam.update(renderer, scene);
+        for (let i = 0; i < captureMats.length; i++) captureMats[i].toneMapped = oldToneMapped[i];
+        renderer.toneMapping = oldTM;
+      }
       debugProbeGroup.visible = wasDebug;
 
       try {
-        const sh = await integrateSH(probeRadianceRT[idx]);
+        let sh = useAnalyticFallback ? makeFallbackSH(idx) : await integrateSH(probeRadianceRT[idx]);
+        if (!useAnalyticFallback && shEnergy(sh) < 1e-4) {
+          useAnalyticFallback = true;
+          sh = makeFallbackSH(idx);
+          readbackFallbackCount++;
+          if (readbackFallbackCount === 1) {
+            bc('probe readback returned black; using analytic fallback probes');
+          }
+        }
         for (let k=0; k<9; k++) probesSH[idx][k].set(sh[k].x, sh[k].y, sh[k].z);
         uploadProbeSHToTex(idx, sh);
         // debug sphere color = ambient SH band
         const sc = 1.0/3.5449;
         const c = sh[0];
         debugSpheres[idx].material.color.setRGB(
-          Math.max(0, Math.min(1, c.x * sc)),
-          Math.max(0, Math.min(1, c.y * sc)),
-          Math.max(0, Math.min(1, c.z * sc))
+          finiteClamp(c.x * sc, 0, 1),
+          finiteClamp(c.y * sc, 0, 1),
+          finiteClamp(c.z * sc, 0, 1)
         );
 
         // Phase 6 — depth pass for Chebyshev visibility. Re-render this probe's
@@ -752,7 +870,7 @@ async function createWebGPUScene(canvas) {
         // distance to the probe instead of radiance, then integrate to mean &
         // mean-squared. This overwrites the radiance in probeRadianceRT[idx],
         // which is fine because we already extracted the SH coefficients above.
-        if (depthMat && uDepthProbePos) {
+        if (!useAnalyticFallback && depthMat && uDepthProbePos) {
           uDepthProbePos.value.copy(probePositions[idx]);
           const prevOverride = scene.overrideMaterial;
           const oldTM2 = renderer.toneMapping;
@@ -763,8 +881,11 @@ async function createWebGPUScene(canvas) {
           renderer.toneMapping = oldTM2;
           try {
             const ds = await integrateDepthStats(probeRadianceRT[idx]);
-            probeDepthMeanArr[idx]   = ds.mean;
-            probeDepthMeanSqArr[idx] = ds.meanSq;
+            probeDepthMeanArr[idx]   = finiteClamp(ds.mean, 0, 50, 100.0);
+            probeDepthMeanSqArr[idx] = Math.max(
+              probeDepthMeanArr[idx] * probeDepthMeanArr[idx],
+              finiteClamp(ds.meanSq, 0, 2500, 10000.0)
+            );
           } catch (e) {
             console.warn(`Probe ${idx} depth integration failed:`, e.message);
           }
@@ -797,6 +918,7 @@ async function createWebGPUScene(canvas) {
     }
   }
   bc('priming complete');
+  fallbackPrimed = useAnalyticFallback;
 
   // ---- GUI ----
   const giModes = {
@@ -811,10 +933,11 @@ async function createWebGPUScene(canvas) {
     giMode: '5 — full trilinear',
     exposure: 1.0,
     showProbes: false,
+    boxWireframe: false,
     giEnabled: true,
-    giIntensity: 1.0,                  // Phase 5a — match WebGL default
-    applyPiFactor: true,               // Phase 5a — match WebGL Lambertian BRDF
-    chebyshevEnabled: true,            // Phase 6 — depth-aware visibility
+    giIntensity: useAnalyticFallback ? 0.65 : 1.0,
+    applyPiFactor: false,              // additive effect: keep the bounce pass visible
+    chebyshevEnabled: false,           // Phase 6 — depth-aware visibility (experimental)
     depthBias: 0.05,                   // Phase 6 — Chebyshev bias
   };
   const gui = new GUI({ title: 'DDGI · WebGPU (diagnostic)', width: 320 });
@@ -823,14 +946,20 @@ async function createWebGPUScene(canvas) {
     bc('GI phase → ' + v);
   });
   if (uGiEnabled)   gui.add(params, 'giEnabled').name('GI enabled').onChange(v => uGiEnabled.value = v ? 1 : 0);
+  if (uGiIntensity) uGiIntensity.value = params.giIntensity;
   // Phase 5a — slider range matches the WebGL scene (0..3) for direct A/B comparison.
   if (uGiIntensity) gui.add(params, 'giIntensity', 0, 3, 0.05).name('GI intensity').onChange(v => uGiIntensity.value = v);
-  if (uGiPiFactor)  gui.add(params, 'applyPiFactor').name('Apply 1/π factor').onChange(v => uGiPiFactor.value = v ? 1 : 0);
+  if (uGiPiFactor) {
+    uGiPiFactor.value = params.applyPiFactor ? 1 : 0;
+    gui.add(params, 'applyPiFactor').name('Apply 1/π factor').onChange(v => uGiPiFactor.value = v ? 1 : 0);
+  }
   // Phase 6 — Chebyshev visibility test toggle + depth bias tuning.
   if (uChebyshevEnabled) gui.add(params, 'chebyshevEnabled').name('Chebyshev visibility').onChange(v => uChebyshevEnabled.value = v ? 1 : 0);
   if (uDepthBias)        gui.add(params, 'depthBias', 0, 0.5, 0.005).name('Depth bias').onChange(v => uDepthBias.value = v);
   gui.add(params, 'showProbes').name('Show probes').onChange(v => debugProbeGroup.visible = v);
+  gui.add(params, 'boxWireframe').name('Box wireframe').onChange(v => boxWireframes.forEach(w => w.visible = v));
   gui.add(params, 'exposure', 0.2, 2.0, 0.05).name('Exposure').onChange(v => renderer.toneMappingExposure = v);
+  debugProbeGroup.visible = params.showProbes;
 
   // ---- render loop ----
   const clock = new THREE.Clock();
@@ -846,7 +975,7 @@ async function createWebGPUScene(canvas) {
     // (movers, lighting tweaks) propagate at similar speed. Single-flight
     // protection inside updateOneProbe() limits actual concurrency.
     asyncTimer += dt;
-    if (asyncTimer > 0.016) {
+    if (!fallbackPrimed && asyncTimer > 0.016) {
       asyncTimer = 0;
       updateOneProbe(); // fire-and-forget
     }
@@ -951,14 +1080,35 @@ async function createWebGLScene(canvas) {
   rectLight.lookAt(0, 0, 0);
   scene.add(rectLight);
 
-  const tallBox = new THREE.Mesh(new THREE.BoxGeometry(0.55, 1.1, 0.55), matWhite);
+  const BOX_SEGMENTS = 28;
+  const boxWireframes = [];
+  const addBoxWireframe = (mesh) => {
+    const wire = new THREE.LineSegments(
+      new THREE.WireframeGeometry(mesh.geometry),
+      new THREE.LineBasicMaterial({
+        color: 0x111111,
+        transparent: true,
+        opacity: 0.42,
+        depthWrite: false
+      })
+    );
+    wire.scale.setScalar(1.003);
+    wire.visible = false;
+    wire.renderOrder = 2;
+    boxWireframes.push(wire);
+    mesh.add(wire);
+  };
+
+  const tallBox = new THREE.Mesh(new THREE.BoxGeometry(0.55, 1.1, 0.55, BOX_SEGMENTS, BOX_SEGMENTS * 2, BOX_SEGMENTS), matWhite);
   tallBox.position.set(-0.3, 0.55, -0.3);
   tallBox.rotation.y = THREE.MathUtils.degToRad(18);
+  addBoxWireframe(tallBox);
   cornell.add(tallBox);
 
-  const shortBox = new THREE.Mesh(new THREE.BoxGeometry(0.55, 0.55, 0.55), matWhite);
+  const shortBox = new THREE.Mesh(new THREE.BoxGeometry(0.55, 0.55, 0.55, BOX_SEGMENTS, BOX_SEGMENTS, BOX_SEGMENTS), matWhite);
   shortBox.position.set(0.32, 0.275, 0.28);
   shortBox.rotation.y = THREE.MathUtils.degToRad(-18);
+  addBoxWireframe(shortBox);
   cornell.add(shortBox);
 
   const moverMat = new THREE.MeshStandardMaterial({
@@ -1047,6 +1197,10 @@ vGiWorldNormal = normalize( ( modelMatrix * vec4( objectNormal, 0.0 ) ).xyz );
 `;
   const giFragmentInject = `
 #define DDGI_PROBE_SH_COUNT ${PROBE_COUNT * 9}
+#define DDGI_PROBE_COUNT ${PROBE_COUNT}
+#define DDGI_PROBE_X ${PROBE_DIMS.x}
+#define DDGI_PROBE_Y ${PROBE_DIMS.y}
+#define DDGI_PROBE_Z ${PROBE_DIMS.z}
 uniform vec3  uProbeSH[ DDGI_PROBE_SH_COUNT ];
 uniform vec3  uProbeMin;
 uniform vec3  uProbeMax;
@@ -1072,17 +1226,22 @@ vec3 ddgi_shIrradiance( vec3 n, int b ) {
 vec3 ddgi_sampleGrid( vec3 wp, vec3 n ) {
     vec3 grid = ( wp - uProbeMin ) / ( uProbeMax - uProbeMin );
     grid = clamp( grid, vec3(0.0), vec3(1.0) ) * ( uProbeDims - vec3(1.0) );
-    vec3 base = floor( grid );
-    vec3 frac = grid - base;
+    const float kernelRadius = 2.35;
     vec3 sum = vec3(0.0); float wSum = 0.0;
-    for ( int i = 0; i < 8; i++ ) {
-        vec3 d = vec3( float( i & 1 ), float( ( i >> 1 ) & 1 ), float( ( i >> 2 ) & 1 ) );
-        vec3 idx = clamp( base + d, vec3(0.0), uProbeDims - vec3(1.0) );
-        vec3 w = mix( vec3(1.0) - frac, frac, d );
-        float weight = max( w.x * w.y * w.z, 0.001 );
-        int pi = int( idx.x + idx.y * uProbeDims.x + idx.z * uProbeDims.x * uProbeDims.y );
+    int pi = 0;
+    for ( int iz = 0; iz < DDGI_PROBE_Z; iz++ ) {
+    for ( int iy = 0; iy < DDGI_PROBE_Y; iy++ ) {
+    for ( int ix = 0; ix < DDGI_PROBE_X; ix++ ) {
+        vec3 idx = vec3( float(ix), float(iy), float(iz) );
+        vec3 d = grid - idx;
+        float q = clamp( dot( d, d ) / ( kernelRadius * kernelRadius ), 0.0, 1.0 );
+        float kernel = 1.0 - q;
+        float weight = kernel * kernel * ( 3.0 - 2.0 * kernel );
         sum  += weight * ddgi_shIrradiance( n, pi * 9 );
         wSum += weight;
+        pi++;
+    }
+    }
     }
     return sum / max( wSum, 1e-4 );
 }
@@ -1154,6 +1313,7 @@ vec3 ddgi_sampleGrid( vec3 wp, vec3 n ) {
   // probe capture
   let nextProbeToUpdate = 0;
   let probeUpdateInFlight = false;
+  let stopped = false;
   const stats = new Stats();
   const _shTmp = [];
   for (let i=0; i<9; i++) _shTmp.push({x:0,y:0,z:0});
@@ -1161,9 +1321,11 @@ vec3 ddgi_sampleGrid( vec3 wp, vec3 n ) {
   async function integrateRadianceSH(rt) {
     for (let k=0; k<9; k++) { _shTmp[k].x = 0; _shTmp[k].y = 0; _shTmp[k].z = 0; }
     for (let f=0; f<6; f++) {
+      if (stopped) return null;
       const buf = new Uint16Array(FACE_SIZE * FACE_SIZE * 4);
       // r172 WebGL signature: readRenderTargetPixels(rt, x, y, w, h, buffer, activeCubeFaceIndex)
       await renderer.readRenderTargetPixelsAsync(rt, 0, 0, FACE_SIZE, FACE_SIZE, buf, f);
+      if (stopped) return null;
       const dirs = FACE_DIRS[f];
       for (let i=0; i<FACE_SIZE*FACE_SIZE; i++) {
         const r = f16ToF32(buf[i*4+0]);
@@ -1190,7 +1352,7 @@ vec3 ddgi_sampleGrid( vec3 wp, vec3 n ) {
   }
 
   async function updateProbes(count) {
-    if (probeUpdateInFlight) return;
+    if (probeUpdateInFlight || stopped) return;
     probeUpdateInFlight = true;
     try {
       const wasDebug = debugProbeGroup.visible;
@@ -1198,12 +1360,14 @@ vec3 ddgi_sampleGrid( vec3 wp, vec3 n ) {
       const oldTM = renderer.toneMapping;
       renderer.toneMapping = THREE.NoToneMapping;
       for (let i=0; i<count; i++) {
+        if (stopped) break;
         const idx = nextProbeToUpdate;
         const cam = cubeCameras[idx];
         cam.position.copy(probePositions[idx]);
         cam.update(renderer, scene);
         try {
           const sh = await integrateRadianceSH(probeRTs[idx]);
+          if (stopped || !sh) break;
           // store SH directly into Vector3[] for this probe
           for (let k=0; k<9; k++) probes[idx][k].set(sh[k].x, sh[k].y, sh[k].z);
           uploadProbeSH(idx);
@@ -1213,8 +1377,10 @@ vec3 ddgi_sampleGrid( vec3 wp, vec3 n ) {
         nextProbeToUpdate = (nextProbeToUpdate + 1) % PROBE_COUNT;
         stats.totalProbeUpdates++;
       }
-      renderer.toneMapping = oldTM;
-      debugProbeGroup.visible = wasDebug;
+      if (!stopped) {
+        renderer.toneMapping = oldTM;
+        debugProbeGroup.visible = wasDebug;
+      }
     } finally {
       probeUpdateInFlight = false;
     }
@@ -1226,13 +1392,14 @@ vec3 ddgi_sampleGrid( vec3 wp, vec3 n ) {
 
   // GUI
   const params = {
-    giEnabled: true, giIntensity: 1.0, showProbes: false,
+    giEnabled: true, giIntensity: 1.0, showProbes: false, boxWireframe: false,
     probesPerFrame: 4, moverActive: true, exposure: 1.0,
   };
   const gui = new GUI({ title: 'DDGI · WebGL', width: 280 });
   gui.add(params, 'giEnabled').name('GI enabled').onChange(v => giUniforms.uGiEnabled.value = v ? 1 : 0);
   gui.add(params, 'giIntensity', 0, 3, 0.05).name('GI intensity').onChange(v => giUniforms.uGiIntensity.value = v);
   gui.add(params, 'showProbes').name('Show probes').onChange(v => debugProbeGroup.visible = v);
+  gui.add(params, 'boxWireframe').name('Box wireframe').onChange(v => boxWireframes.forEach(w => w.visible = v));
   gui.add(params, 'probesPerFrame', 1, 16, 1).name('Probes / frame');
   gui.add(params, 'moverActive').name('Animate mover');
   gui.add(params, 'exposure', 0.2, 2.0, 0.05).name('Exposure').onChange(v => renderer.toneMappingExposure = v);
@@ -1240,7 +1407,6 @@ vec3 ddgi_sampleGrid( vec3 wp, vec3 n ) {
 
   const clock = new THREE.Clock();
   let rafId;
-  let stopped = false;
   function tick() {
     if (stopped) return;
     rafId = requestAnimationFrame(tick);
@@ -1271,10 +1437,15 @@ vec3 ddgi_sampleGrid( vec3 wp, vec3 n ) {
   window.addEventListener('resize', onResize);
 
   return {
-    dispose() {
+    async dispose() {
       stopped = true;
       cancelAnimationFrame(rafId);
       window.removeEventListener('resize', onResize);
+      // Wait for any in-flight probe readback to bail out before disposing the
+      // render targets it is reading from. Otherwise three.js's
+      // readRenderTargetPixelsAsync trips on a missing __webglFramebuffer when
+      // the cube RT is disposed mid-flight.
+      while (probeUpdateInFlight) await new Promise(r => setTimeout(r, 0));
       gui.destroy();
       controls.dispose();
       probeRTs.forEach(rt => rt.dispose());
