@@ -1757,14 +1757,11 @@ async function createWebGPURTScene(canvas) {
     size: TOTAL_RAYS * 16,
     usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
   });
-  // Debug: stage one probe's worth of rays back to CPU so we can visualize
-  // the radiance each direction captured.
-  const DEBUG_PROBE_IDX = (PROBE_DIMS.z - 1) * (PROBE_DIMS.x * PROBE_DIMS.y)
-                        + (PROBE_DIMS.y - 1) * PROBE_DIMS.x
-                        + (PROBE_DIMS.x - 1); // top-right-front
+  // Debug: stage every probe's rays back to CPU so we can visualize each
+  // direction's captured radiance for every probe.
   const debugRayReadBuf = device.createBuffer({
     label: 'debug-ray-readback',
-    size: RAYS_PER_PROBE * 16,
+    size: TOTAL_RAYS * 16,
     usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
   });
 
@@ -2108,11 +2105,16 @@ fn hash11(x: u32) -> f32 {
   return f32(n) / f32(0xffffffffu);
 }
 
-// Fibonacci sphere direction, jittered by frame seed for temporal coverage.
+// Fibonacci sphere direction. cosTheta uses *only* rayI (so it walks evenly
+// from +1 to -1 across the ray batch). The seed perturbs *only* the azimuth
+// — rotating the spiral around the pole — which preserves the uniform sphere
+// distribution while still giving per-probe / per-frame variation. The old
+// version added seed into cosTheta, which pushed it far outside [-1,1] for
+// large probe indices and collapsed all rays to a single direction.
 fn fibSphere(rayI: u32, total: u32, seed: f32) -> vec3<f32> {
   let golden = 0.5 * (sqrt(5.0) - 1.0);
-  let i = f32(rayI) + 0.5 + seed;
-  let phi = 2.0 * PI * fract(i * golden);
+  let i = f32(rayI) + 0.5;
+  let phi = 2.0 * PI * fract(i * golden + seed * golden);
   let cosTheta = 1.0 - 2.0 * (i / f32(total));
   let sinTheta = sqrt(max(0.0, 1.0 - cosTheta * cosTheta));
   return vec3<f32>(cos(phi) * sinTheta, sin(phi) * sinTheta, cosTheta);
@@ -2212,8 +2214,8 @@ const PI: f32 = 3.14159265358979;
 
 fn fibSphere(rayI: u32, total: u32, seed: f32) -> vec3<f32> {
   let golden = 0.5 * (sqrt(5.0) - 1.0);
-  let i = f32(rayI) + 0.5 + seed;
-  let phi = 2.0 * PI * fract(i * golden);
+  let i = f32(rayI) + 0.5;
+  let phi = 2.0 * PI * fract(i * golden + seed * golden);
   let cosTheta = 1.0 - 2.0 * (i / f32(total));
   let sinTheta = sqrt(max(0.0, 1.0 - cosTheta * cosTheta));
   return vec3<f32>(cos(phi) * sinTheta, sin(phi) * sinTheta, cosTheta);
@@ -2626,9 +2628,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
     enc.copyBufferToBuffer(probeSHBuf, 0, probeSHReadBuf, 0, probeSHBufBytes);
     enc.copyBufferToBuffer(probeDepthBuf, 0, probeDepthReadBuf, 0, PROBE_COUNT * 16);
-    // Debug: copy the chosen probe's slice of rayHits into the staging buffer.
-    enc.copyBufferToBuffer(rayHitsBuf, DEBUG_PROBE_IDX * RAYS_PER_PROBE * 16,
-                           debugRayReadBuf, 0, RAYS_PER_PROBE * 16);
+    // Debug: copy every probe's rays into the staging buffer for full-scene
+    // ray visualization.
+    enc.copyBufferToBuffer(rayHitsBuf, 0, debugRayReadBuf, 0, TOTAL_RAYS * 16);
     device.queue.submit([enc.finish()]);
 
     await Promise.all([
@@ -2649,7 +2651,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
       probeTrappedFlags[p]   = trapped;
       if (probeTrappedFloatArr) probeTrappedFloatArr[p] = trapped ? 1.0 : 0.0;
     }
-    // Debug: pull this probe's rays out and rebuild the line visualization.
+    // Debug: pull every probe's rays and rebuild the line visualization.
     const rayView = new Float32Array(debugRayReadBuf.getMappedRange());
     const debugRays = new Float32Array(rayView); // copy out before unmap
     debugRayReadBuf.unmap();
@@ -2657,61 +2659,73 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     probeDepthReadBuf.unmap();
     stats.totalProbeUpdates += PROBE_COUNT;
     updateDebugProbeColors();
-    updateDebugRayLines(debugRays, frameSeed, DEBUG_PROBE_IDX);
+    updateDebugRayLines(debugRays, frameSeed);
   }
 
   // Mirror of WGSL fibSphere — must produce identical directions per ray.
   function fibSphereJS(rayI, total, seed) {
     const golden = 0.5 * (Math.sqrt(5.0) - 1.0);
-    const i = rayI + 0.5 + seed;
-    const phi = 2.0 * Math.PI * (i * golden - Math.floor(i * golden));
+    const i = rayI + 0.5;
+    const f = i * golden + seed * golden;
+    const phi = 2.0 * Math.PI * (f - Math.floor(f));
     const cosTheta = 1.0 - 2.0 * (i / total);
     const sinTheta = Math.sqrt(Math.max(0.0, 1.0 - cosTheta * cosTheta));
     return [Math.cos(phi) * sinTheta, Math.sin(phi) * sinTheta, cosTheta];
   }
 
-  // Single line-segments mesh, rebuilt each bake. Each segment goes from the
-  // probe origin out along the ray direction, length = clamped hit distance.
-  // Colour = clamped radiance the ray captured (so red bleed shows up red).
+  // One LineSegments mesh covering rays from every probe. Each segment goes
+  // from a probe origin out along its ray direction, length = clamped hit
+  // distance. Colour = clamped radiance the ray captured.
+  // PROBE_COUNT * RAYS_PER_PROBE segments = 2× that many vertices × 3 floats.
   const debugRayGeo = new THREE.BufferGeometry();
-  const debugRayPositions = new Float32Array(RAYS_PER_PROBE * 2 * 3);
-  const debugRayColors    = new Float32Array(RAYS_PER_PROBE * 2 * 3);
+  const debugRayPositions = new Float32Array(TOTAL_RAYS * 2 * 3);
+  const debugRayColors    = new Float32Array(TOTAL_RAYS * 2 * 3);
   debugRayGeo.setAttribute('position', new THREE.BufferAttribute(debugRayPositions, 3).setUsage(THREE.DynamicDrawUsage));
   debugRayGeo.setAttribute('color',    new THREE.BufferAttribute(debugRayColors, 3).setUsage(THREE.DynamicDrawUsage));
-  const debugRayMat = new THREE.LineBasicMaterial({ vertexColors: true, transparent: true, depthTest: false });
+  const debugRayMat = new THREE.LineBasicMaterial({ vertexColors: true, transparent: true, opacity: 0.35, depthTest: false });
   const debugRayLines = new THREE.LineSegments(debugRayGeo, debugRayMat);
   debugRayLines.frustumCulled = false;
   debugRayLines.renderOrder = 999;
+  debugRayLines.visible = false; // toggle via "Show ray debug" in the GUI
   scene.add(debugRayLines);
 
-  function updateDebugRayLines(rayData, frameSeed, probeIdx) {
-    const probe = probePositions[probeIdx];
-    // Seed must match RT pass exactly: U.rtMeta.z + probeIdx * 0.61803.
-    const seed = frameSeed + probeIdx * 0.61803;
+  function updateDebugRayLines(rayData, frameSeed) {
+    if (!debugRayLines.visible) return; // skip the heavy CPU work when hidden
     const posAttr = debugRayGeo.attributes.position;
     const colAttr = debugRayGeo.attributes.color;
-    for (let i = 0; i < RAYS_PER_PROBE; i++) {
-      const dir = fibSphereJS(i, RAYS_PER_PROBE, seed);
-      const r = rayData[i * 4 + 0];
-      const g = rayData[i * 4 + 1];
-      const b = rayData[i * 4 + 2];
-      const signedDist = rayData[i * 4 + 3];
-      const dist = Math.min(Math.abs(signedDist), 2.0); // clip to keep lines short
-      const o = i * 6;
-      // segment start: probe centre
-      posAttr.array[o + 0] = probe.x;
-      posAttr.array[o + 1] = probe.y;
-      posAttr.array[o + 2] = probe.z;
-      // segment end: probe + dir * dist
-      posAttr.array[o + 3] = probe.x + dir[0] * dist;
-      posAttr.array[o + 4] = probe.y + dir[1] * dist;
-      posAttr.array[o + 5] = probe.z + dir[2] * dist;
-      // colour: clamp radiance to [0,1] for display; both endpoints same colour
-      const cr = Math.min(1.0, r);
-      const cg = Math.min(1.0, g);
-      const cb = Math.min(1.0, b);
-      colAttr.array[o + 0] = cr; colAttr.array[o + 1] = cg; colAttr.array[o + 2] = cb;
-      colAttr.array[o + 3] = cr; colAttr.array[o + 4] = cg; colAttr.array[o + 5] = cb;
+    const pos = posAttr.array;
+    const col = colAttr.array;
+    for (let p = 0; p < PROBE_COUNT; p++) {
+      const probe = probePositions[p];
+      // Seed must match RT pass exactly: U.rtMeta.z + probeIdx * 0.61803.
+      const seed = frameSeed + p * 0.61803;
+      const probeRayBase = p * RAYS_PER_PROBE * 4;
+      const segBase = p * RAYS_PER_PROBE * 6;
+      for (let i = 0; i < RAYS_PER_PROBE; i++) {
+        const dir = fibSphereJS(i, RAYS_PER_PROBE, seed);
+        const r = rayData[probeRayBase + i * 4 + 0];
+        const g = rayData[probeRayBase + i * 4 + 1];
+        const b = rayData[probeRayBase + i * 4 + 2];
+        const signedDist = rayData[probeRayBase + i * 4 + 3];
+        // RT pass writes hitDist=50.0 for miss rays; collapse those to a
+        // zero-length segment so they don't draw as a uniform 2.0-length
+        // black streak across the visualization.
+        const absDist = Math.abs(signedDist);
+        const isMiss  = absDist >= 49.0;
+        const dist    = isMiss ? 0.0 : Math.min(absDist, 4.0);
+        const o = segBase + i * 6;
+        pos[o + 0] = probe.x;
+        pos[o + 1] = probe.y;
+        pos[o + 2] = probe.z;
+        pos[o + 3] = probe.x + dir[0] * dist;
+        pos[o + 4] = probe.y + dir[1] * dist;
+        pos[o + 5] = probe.z + dir[2] * dist;
+        const cr = Math.min(1.0, r);
+        const cg = Math.min(1.0, g);
+        const cb = Math.min(1.0, b);
+        col[o + 0] = cr; col[o + 1] = cg; col[o + 2] = cb;
+        col[o + 3] = cr; col[o + 4] = cg; col[o + 5] = cb;
+      }
     }
     posAttr.needsUpdate = true;
     colAttr.needsUpdate = true;
@@ -2758,6 +2772,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     wallWhite: '#' + matWhite.color.getHexString(),
     bounces: 4,
     showProbes: false,
+    showDebugRays: false,
     rebake: () => bakeAllProbes(params.bounces),
   };
   const gui = new GUI({ title: 'DDGI · WebGPU raytraced', width: 320 });
@@ -2790,6 +2805,12 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
   const fView = gui.addFolder('View');
   fView.add(params, 'showProbes').name('Show probes').onChange(v => debugProbeGroup.visible = v);
+  // Toggling rays on triggers a rebake so updateDebugRayLines runs against
+  // fresh ray data (it bails when hidden to avoid the per-frame CPU cost).
+  fView.add(params, 'showDebugRays').name('Show ray debug').onChange(v => {
+    debugRayLines.visible = v;
+    if (v) scheduleRebake();
+  });
 
   // ---------- Initial bake + render loop ----------
   // Hide the canvas until the first bake settles so the user never sees the
