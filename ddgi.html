@@ -1695,6 +1695,13 @@ async function createWebGPURTScene(canvas) {
   // alignment).
   const probePositions = [];
   const probePosBuf32 = new Float32Array(PROBE_COUNT * 4);
+  // Home positions: the regular grid lerp'd between PROBE_MIN/MAX. Each probe
+  // is allowed to drift up to MAX_PROBE_OFFSET away from its home so trapped
+  // probes can escape geometry over a few bakes (DDGI "probe relocation").
+  // The trilinear interpolator still uses the home-grid coordinates — the
+  // physical position only affects what the probe captures in the RT pass.
+  const probeHomePositions = [];
+  const probeOffsets = []; // per-probe Vector3 drift from home
   for (let z = 0, i = 0; z < PROBE_DIMS.z; z++)
     for (let y = 0; y < PROBE_DIMS.y; y++)
       for (let x = 0; x < PROBE_DIMS.x; x++, i++) {
@@ -1703,12 +1710,23 @@ async function createWebGPURTScene(canvas) {
           THREE.MathUtils.lerp(PROBE_MIN.y, PROBE_MAX.y, y/(PROBE_DIMS.y-1)),
           THREE.MathUtils.lerp(PROBE_MIN.z, PROBE_MAX.z, z/(PROBE_DIMS.z-1))
         );
+        probeHomePositions.push(p.clone());
+        probeOffsets.push(new THREE.Vector3());
         probePositions.push(p);
         probePosBuf32[i*4 + 0] = p.x;
         probePosBuf32[i*4 + 1] = p.y;
         probePosBuf32[i*4 + 2] = p.z;
         probePosBuf32[i*4 + 3] = 0.0;
       }
+  // Cell spacing — half of this is the max allowed drift per axis. Standard
+  // DDGI keeps probes inside their original cell so trilinear weights stay
+  // valid. We use the *minimum* axis spacing so a probe never crosses a
+  // neighbour's home position.
+  const PROBE_SPACING_X = (PROBE_MAX.x - PROBE_MIN.x) / (PROBE_DIMS.x - 1);
+  const PROBE_SPACING_Y = (PROBE_MAX.y - PROBE_MIN.y) / (PROBE_DIMS.y - 1);
+  const PROBE_SPACING_Z = (PROBE_MAX.z - PROBE_MIN.z) / (PROBE_DIMS.z - 1);
+  const MAX_PROBE_OFFSET = 0.45 * Math.min(PROBE_SPACING_X, PROBE_SPACING_Y, PROBE_SPACING_Z);
+  const RELOCATION_STEP  = 0.6; // 0..1: how much of the suggested move we apply each bake
   const probePosBuf = device.createBuffer({
     label: 'probe-positions',
     size: probePosBuf32.byteLength,
@@ -1723,11 +1741,17 @@ async function createWebGPURTScene(canvas) {
   debugProbeGroup.visible = false;
   scene.add(debugProbeGroup);
   const debugSpheres = [];
+  // Share one geometry across all probes — saves a lot of memory/draw setup
+  // for 343 spheres, and they all have identical shape.
+  const debugSphereGeo = new THREE.SphereGeometry(0.025, 16, 10);
   for (let i = 0; i < PROBE_COUNT; i++) {
-    const sphere = new THREE.Mesh(
-      new THREE.SphereGeometry(0.04, 12, 8),
-      new MeshBasicNodeMaterial({ color: 0x222222 })
-    );
+    // toneMapped=false keeps the band-0 tint readable: ACES would otherwise
+    // crush near-white probes into pure white (the bright halo effect) and
+    // bury low-magnitude tints. Each probe's colour is set in
+    // updateDebugProbeColors() from its oct-map band-0 equivalent.
+    const mat = new MeshBasicNodeMaterial({ color: 0x808080 });
+    mat.toneMapped = false;
+    const sphere = new THREE.Mesh(debugSphereGeo, mat);
     sphere.position.copy(probePositions[i]);
     debugProbeGroup.add(sphere);
     debugSpheres.push(sphere);
@@ -1739,23 +1763,43 @@ async function createWebGPURTScene(canvas) {
   // fragment-shader trilinear loop can downweight a trapped probe's contribution.
   // Forward-declared so the TSL builder (run later) sees the same array.
   let probeTrappedFloatArr = null;
+  function readProbeOctBand0Equivalent(idx) {
+    const probeX = idx * OCT_RES;
+    let sumR = 0.0;
+    let sumG = 0.0;
+    let sumB = 0.0;
+    for (let ty = 0; ty < OCT_RES; ty++) {
+      let rowOff = (ty * OCT_TEX_W + probeX) * 4;
+      for (let tx = 0; tx < OCT_RES; tx++, rowOff += 4) {
+        sumR += probeOctData[rowOff + 0];
+        sumG += probeOctData[rowOff + 1];
+        sumB += probeOctData[rowOff + 2];
+      }
+    }
+    const invTexels = 1.0 / OCT_TEXELS;
+    return [sumR * invTexels, sumG * invTexels, sumB * invTexels];
+  }
   function updateDebugProbeColors() {
-    // Convert each probe's band-0 SH (the DC ambient) to a sphere tint.
+    // Convert each probe's 8x8 oct map to a band-0-equivalent tint by averaging
+    // its texels. The oct layout is roughly equal-solid-angle, so the mean is a
+    // stable ambient proxy for debug coloring.
     // Trapped probes (inside geometry) are marked with a magenta tint so
-    // they're visually obvious during debugging — their SH was reseeded
+    // they're visually obvious during debugging — their oct map was reseeded
     // from neighbours so the color won't be black even though they would
     // have captured zero radiance themselves.
-    const sc = 1.0 / 3.5449;
+    // Soft Reinhard (x / (x+1)) on the mean irradiance keeps bright probes
+    // from clipping to pure white while preserving the chromatic tint —
+    // important now that the debug material has toneMapped=false (so we
+    // can't rely on ACES to compress out-of-range values).
     for (let i = 0; i < PROBE_COUNT; i++) {
       if (probeTrappedFlags[i]) {
         debugSpheres[i].material.color.setRGB(1.0, 0.0, 0.6);
       } else {
-        const c = probeSHFlat[i * 9];
-        debugSpheres[i].material.color.setRGB(
-          Math.max(0, Math.min(1, c.x * sc)),
-          Math.max(0, Math.min(1, c.y * sc)),
-          Math.max(0, Math.min(1, c.z * sc))
-        );
+        const [rMean, gMean, bMean] = readProbeOctBand0Equivalent(i);
+        const r = Math.max(0, rMean);
+        const g = Math.max(0, gMean);
+        const b = Math.max(0, bMean);
+        debugSpheres[i].material.color.setRGB(r/(1+r), g/(1+g), b/(1+b));
       }
     }
   }
@@ -1775,19 +1819,23 @@ async function createWebGPURTScene(canvas) {
     usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
   });
 
-  // Per-probe SH (9 vec3 = 9 vec4 with padding = 144 bytes/probe) + depth
-  // moments (vec2 -> 8 bytes/probe, padded to 16 for alignment).
-  const SH_VEC4_PER_PROBE = 9;
-  const probeSHBufBytes = PROBE_COUNT * SH_VEC4_PER_PROBE * 16;
-  const probeSHBuf = device.createBuffer({
-    label: 'probe-sh',
-    size: probeSHBufBytes,
+  // Per-probe octahedral irradiance map: 8×8 = 64 RGBA f32 texels (16 bytes
+  // each) per probe. Stored as a flat array of vec4<f32> so we can index it
+  // as `probeOct[probeIdx * 64 + texelIdx]` in WGSL. 8×8 matches NVIDIA's
+  // RTXGI/DDGI reference defaults — plenty of angular resolution for diffuse
+  // GI without ballooning storage. (16×16 would 4× the memory and CPU
+  // readback cost; 8×8 hits the sweet spot.)
+  const OCT_RES = 8;
+  const OCT_TEXELS = OCT_RES * OCT_RES; // 64
+  const probeOctBufBytes = PROBE_COUNT * OCT_TEXELS * 16;
+  const probeOctBuf = device.createBuffer({
+    label: 'probe-oct',
+    size: probeOctBufBytes,
     usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
   });
-  // Initialise to zero (default after createBuffer is undefined; explicit zero
-  // fill so the first ray-tracing pass that reads the SH cache for indirect
-  // bounce sees zero, not garbage).
-  device.queue.writeBuffer(probeSHBuf, 0, new Float32Array(probeSHBufBytes / 4));
+  // Initialise to zero so the first RT pass that reads the cache for indirect
+  // bounce lookup sees zero, not garbage.
+  device.queue.writeBuffer(probeOctBuf, 0, new Float32Array(probeOctBufBytes / 4));
 
   const probeDepthBuf = device.createBuffer({
     label: 'probe-depth-moments',
@@ -1796,9 +1844,9 @@ async function createWebGPURTScene(canvas) {
   });
 
   // Staging buffers for readback (created lazily once, reused every bake).
-  const probeSHReadBuf = device.createBuffer({
-    label: 'probe-sh-readback',
-    size: probeSHBufBytes,
+  const probeOctReadBuf = device.createBuffer({
+    label: 'probe-oct-readback',
+    size: probeOctBufBytes,
     usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
   });
   const probeDepthReadBuf = device.createBuffer({
@@ -1874,7 +1922,7 @@ struct RTUniforms {
 @group(0) @binding(3) var<storage, read> triData:   array<f32>;      // 18 f32 per tri
 @group(0) @binding(4) var<storage, read> triMatId:  array<u32>;
 @group(0) @binding(5) var<storage, read> probePos:  array<vec4<f32>>;
-@group(0) @binding(6) var<storage, read> probeSHIn: array<vec4<f32>>;// 9 vec4 per probe
+@group(0) @binding(6) var<storage, read> probeOctIn: array<vec4<f32>>; // 64 vec4 per probe (8x8 oct map)
 @group(0) @binding(7) var<storage, read_write> rayHits: array<vec4<f32>>;
 
 const PI : f32 = 3.14159265358979;
@@ -2048,34 +2096,54 @@ fn occluded(ro: vec3<f32>, rd: vec3<f32>, tMax: f32) -> bool {
   return false;
 }
 
-// Sample previous-frame SH at a world-space point — this is what gives DDGI
-// its infinite-bounce property. Trilinear over the 8 nearest probes, no
-// Chebyshev (the fragment shader does that for the camera's POV; here we just
-// want a smooth radiance cache for indirect bounces).
-fn evalSH(n: vec3<f32>, probeIdx: u32) -> vec3<f32> {
-  let base = probeIdx * 9u;
-  let c0 = probeSHIn[base+0u].xyz;
-  let c1 = probeSHIn[base+1u].xyz;
-  let c2 = probeSHIn[base+2u].xyz;
-  let c3 = probeSHIn[base+3u].xyz;
-  let c4 = probeSHIn[base+4u].xyz;
-  let c5 = probeSHIn[base+5u].xyz;
-  let c6 = probeSHIn[base+6u].xyz;
-  let c7 = probeSHIn[base+7u].xyz;
-  let c8 = probeSHIn[base+8u].xyz;
-  let x = n.x; let y = n.y; let z = n.z;
-  return c0 * 0.886227
-       + c1 * (2.0 * 0.511664 * y)
-       + c2 * (2.0 * 0.511664 * z)
-       + c3 * (2.0 * 0.511664 * x)
-       + c4 * (2.0 * 0.429043 * x*y)
-       + c5 * (2.0 * 0.429043 * y*z)
-       + c6 * (z*z*0.743125 - 0.247708)
-       + c7 * (2.0 * 0.429043 * x*z)
-       + c8 * (0.429043 * (x*x - y*y));
+// Octahedral encoding — maps a unit direction to a unit-square UV. Standard
+// formulation from "A Survey of Efficient Representations for Independent
+// Unit Vectors" (Cigolle et al, 2014). Used by DDGI to flatten each probe's
+// hemisphere into an 8×8 image where each texel = irradiance from a roughly
+// equal solid angle.
+fn octEncode(n_in: vec3<f32>) -> vec2<f32> {
+  let n = n_in / (abs(n_in.x) + abs(n_in.y) + abs(n_in.z));
+  var uv = vec2<f32>(n.x, n.y);
+  if (n.z < 0.0) {
+    let s = vec2<f32>(select(-1.0, 1.0, uv.x >= 0.0),
+                      select(-1.0, 1.0, uv.y >= 0.0));
+    uv = (1.0 - abs(vec2<f32>(uv.y, uv.x))) * s;
+  }
+  return uv * 0.5 + 0.5; // 0..1
 }
 
-fn sampleProbeGridSH(p: vec3<f32>, n: vec3<f32>) -> vec3<f32> {
+const OCT_RES_F: f32 = 8.0;
+const OCT_TEX:   u32 = 64u;
+
+// Read the (possibly bilinear-filtered) irradiance from a single probe's
+// 8×8 oct map, given a direction n.
+fn sampleProbeOct(probeIdx: u32, n: vec3<f32>) -> vec3<f32> {
+  let uv = octEncode(n) * OCT_RES_F - 0.5;
+  let base = probeIdx * OCT_TEX;
+  let x0 = clamp(i32(floor(uv.x)), 0, 7);
+  let y0 = clamp(i32(floor(uv.y)), 0, 7);
+  let x1 = min(x0 + 1, 7);
+  let y1 = min(y0 + 1, 7);
+  let fx = clamp(uv.x - f32(x0), 0.0, 1.0);
+  let fy = clamp(uv.y - f32(y0), 0.0, 1.0);
+  let i00 = base + u32(y0 * 8 + x0);
+  let i10 = base + u32(y0 * 8 + x1);
+  let i01 = base + u32(y1 * 8 + x0);
+  let i11 = base + u32(y1 * 8 + x1);
+  let c00 = probeOctIn[i00].xyz;
+  let c10 = probeOctIn[i10].xyz;
+  let c01 = probeOctIn[i01].xyz;
+  let c11 = probeOctIn[i11].xyz;
+  let cx0 = mix(c00, c10, fx);
+  let cx1 = mix(c01, c11, fx);
+  return mix(cx0, cx1, fy);
+}
+
+// Sample previous-frame irradiance at a world-space point — this is what
+// gives DDGI its infinite-bounce property. Trilinear over the 8 nearest
+// probes, no Chebyshev (the fragment shader does that for the camera's POV;
+// here we just want a smooth radiance cache for indirect bounces).
+fn sampleProbeGridOct(p: vec3<f32>, n: vec3<f32>) -> vec3<f32> {
   let dims = U.probeDimsR.xyz;
   let pmin = U.probeMin.xyz;
   let pmax = U.probeMax.xyz;
@@ -2097,7 +2165,7 @@ fn sampleProbeGridSH(p: vec3<f32>, n: vec3<f32>) -> vec3<f32> {
         let tz = select(1.0 - frac.z, frac.z, cz == 1);
         let w = max(tx * ty * tz, 1e-5);
         let idx = iz * Dx * Dy + iy * Dx + ix;
-        sum = sum + max(evalSH(n, idx), vec3<f32>(0.0)) * w;
+        sum = sum + max(sampleProbeOct(idx, n), vec3<f32>(0.0)) * w;
         wSum = wSum + w;
       }
     }
@@ -2188,7 +2256,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     // accumulate — capping here would prevent multi-bounce from reaching
     // steady-state where colored walls saturate enough to bleed visibly.
     // The per-ray total radiance clamp below (line ~2160) is the safety net.
-    let indirect = max(sampleProbeGridSH(h.pos, h.nrm), vec3<f32>(0.0));
+    let indirect = max(sampleProbeGridOct(h.pos, h.nrm), vec3<f32>(0.0));
     radiance = radiance + albedo * indirect * U.rtMeta.w / PI;
   }
   // Final per-ray clamp — generous now that the SH math is correctly
@@ -2212,15 +2280,12 @@ struct IntUniforms {
 };
 @group(0) @binding(0) var<uniform> U: IntUniforms;
 @group(0) @binding(1) var<storage, read> rayHits: array<vec4<f32>>;
-@group(0) @binding(2) var<storage, read_write> probeSH: array<vec4<f32>>;     // 9 vec4/probe
-@group(0) @binding(3) var<storage, read_write> probeDepth: array<vec4<f32>>;  // mean,meanSq,_,_
+@group(0) @binding(2) var<storage, read_write> probeOct: array<vec4<f32>>;    // 64 vec4/probe (8x8)
+@group(0) @binding(3) var<storage, read_write> probeDepth: array<vec4<f32>>;  // mean,meanSq,_,trapped
 
 const PI: f32 = 3.14159265358979;
-
-// We project raw radiance L_l^m and let the fragment shader apply the
-// cosine-convolution normalization via its precomputed combined constants
-// (e.g. 2*0.511664 already encodes 2π/3 * basis). Pre-applying cosBand here
-// would double-count the convolution and produce mis-coloured reconstruction.
+const OCT_RES: u32 = 8u;
+const OCT_TEX: u32 = 64u;
 
 fn fibSphere(rayI: u32, total: u32, seed: f32) -> vec3<f32> {
   let golden = 0.5 * (sqrt(5.0) - 1.0);
@@ -2231,85 +2296,99 @@ fn fibSphere(rayI: u32, total: u32, seed: f32) -> vec3<f32> {
   return vec3<f32>(cos(phi) * sinTheta, sin(phi) * sinTheta, cosTheta);
 }
 
+// Octahedral decode: (texelX, texelY) in [0..7] -> world unit direction.
+// Center of texel n is at (n+0.5)/OCT_RES in [0..1]; map to [-1..1] then
+// inverse the octahedral fold.
+fn octDirFromTexel(tx: u32, ty: u32) -> vec3<f32> {
+  let uv = (vec2<f32>(f32(tx), f32(ty)) + 0.5) / f32(OCT_RES);
+  let p  = uv * 2.0 - 1.0;
+  var n = vec3<f32>(p.x, p.y, 1.0 - abs(p.x) - abs(p.y));
+  if (n.z < 0.0) {
+    let t = vec2<f32>(n.x, n.y);
+    n.x = (1.0 - abs(t.y)) * select(-1.0, 1.0, t.x >= 0.0);
+    n.y = (1.0 - abs(t.x)) * select(-1.0, 1.0, t.y >= 0.0);
+  }
+  return normalize(n);
+}
+
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let probeIdx = gid.x;
   if (probeIdx >= U.numProbes) { return; }
   let raysPer = U.raysPerProbe;
-  let weight = 4.0 * PI / f32(raysPer); // uniform sphere measure
 
-  var sh: array<vec3<f32>, 9>;
-  for (var k: u32 = 0u; k < 9u; k = k + 1u) { sh[k] = vec3<f32>(0.0); }
+  // First pass over rays: depth moments + backface count. We don't need to
+  // store ray directions / radiance here — they're already in rayHits and
+  // we re-derive directions from fibSphere in the texel loop.
   var depthSum = 0.0;
   var depthSumSq = 0.0;
   var backfaceCount: u32 = 0u;
-
   for (var i: u32 = 0u; i < raysPer; i = i + 1u) {
-    let rayId = probeIdx * raysPer + i;
-    let hit = rayHits[rayId];
-    let radiance = hit.xyz;
-    // hit.w < 0 means the ray hit the inside of a triangle (backface) — the
-    // RT pass encoded this as a sign on the distance to save a binding slot.
+    let hit = rayHits[probeIdx * raysPer + i];
     let signedDist = hit.w;
-    let isBackface = signedDist < 0.0;
     let dist = min(abs(signedDist), U.depthRange);
-    if (isBackface) { backfaceCount = backfaceCount + 1u; }
-    // Seed must match the RT pass exactly — directions encode the radiance.
-    let d = fibSphere(i, raysPer, U.frameSeed + f32(probeIdx) * 0.61803);
-    // Skip backface samples in SH projection — they represent rays trapped
-    // inside geometry, contributing junk radiance that distorts neighbours
-    // when the trapped probe later seeds an indirect bounce.
-    if (!isBackface) {
-      let rw = radiance * weight;
-      sh[0] = sh[0] + rw * 0.282095;
-      sh[1] = sh[1] + rw * (0.488603 * d.y);
-      sh[2] = sh[2] + rw * (0.488603 * d.z);
-      sh[3] = sh[3] + rw * (0.488603 * d.x);
-      sh[4] = sh[4] + rw * (1.092548 * d.x * d.y);
-      sh[5] = sh[5] + rw * (1.092548 * d.y * d.z);
-      sh[6] = sh[6] + rw * (0.315392 * (3.0 * d.z * d.z - 1.0));
-      sh[7] = sh[7] + rw * (1.092548 * d.x * d.z);
-      sh[8] = sh[8] + rw * (0.546274 * (d.x * d.x - d.y * d.y));
-    }
+    if (signedDist < 0.0) { backfaceCount = backfaceCount + 1u; }
     depthSum   = depthSum   + dist;
     depthSumSq = depthSumSq + dist * dist;
   }
-
-  // If >10% of rays hit backfaces, the probe is buried in (or grazing) geometry.
-  // Lowered from 0.25 because a probe whose center sits just outside a face
-  // still slips through with ~10–20% backface rays and contributes flat/dim SH
-  // that pulls dark spots onto neighbouring surfaces during trilinear blending.
+  // 2% threshold: any probe with even a few backface rays is grazing/inside
+  // geometry and its directional bins would be unreliable. Mark trapped.
   let backfaceRatio = f32(backfaceCount) / f32(raysPer);
-  let trapped = backfaceRatio > 0.10;
+  let trapped = backfaceRatio > 0.02;
 
-  for (var k: u32 = 0u; k < 9u; k = k + 1u) {
-    if (trapped) {
-      probeSH[probeIdx * 9u + k] = vec4<f32>(0.0);
-    } else {
-      let scaled = clamp(sh[k], vec3<f32>(-64.0), vec3<f32>(64.0));
-      probeSH[probeIdx * 9u + k] = vec4<f32>(scaled, 0.0);
-    }
-  }
   let meanD   = clamp(depthSum   / f32(raysPer), 0.0, U.depthRange);
   let meanDSq = max(meanD * meanD, clamp(depthSumSq / f32(raysPer), 0.0, U.depthRange * U.depthRange));
   probeDepth[probeIdx] = vec4<f32>(meanD, meanDSq, 0.0, select(0.0, 1.0, trapped));
+
+  // Second pass: for each of the 64 oct texels, compute the cosine-weighted
+  // sum of all rays (skipping backfaces) and write to the oct map. The
+  // cosine kernel is centred on the texel's world direction, so each texel
+  // is an independent irradiance estimate for that direction. With 256 rays
+  // and 64 texels, every texel sees on average 128 rays in its hemisphere
+  // (cos > 0), which is plenty for a smooth result.
+  let raySeed = U.frameSeed;
+  for (var ty: u32 = 0u; ty < OCT_RES; ty = ty + 1u) {
+    for (var tx: u32 = 0u; tx < OCT_RES; tx = tx + 1u) {
+      let outIdx = probeIdx * OCT_TEX + ty * OCT_RES + tx;
+      if (trapped) {
+        probeOct[outIdx] = vec4<f32>(0.0);
+        continue;
+      }
+      let texelDir = octDirFromTexel(tx, ty);
+      var num = vec3<f32>(0.0);
+      var den = 0.0;
+      for (var i: u32 = 0u; i < raysPer; i = i + 1u) {
+        let hit = rayHits[probeIdx * raysPer + i];
+        if (hit.w < 0.0) { continue; } // skip backface rays
+        let rd = fibSphere(i, raysPer, raySeed + f32(probeIdx) * 0.61803);
+        let w = max(dot(rd, texelDir), 0.0);
+        num = num + hit.xyz * w;
+        den = den + w;
+      }
+      let irr = num / max(den, 1e-4);
+      // Modest clamp to keep a pathological hot-spike from blowing the cache.
+      let clamped = clamp(irr, vec3<f32>(0.0), vec3<f32>(8.0));
+      probeOct[outIdx] = vec4<f32>(clamped, 0.0);
+    }
+  }
 }
 `;
 
-  // Neighbour-seed pass: trapped probes (probeDepth.w == 1.0) are reseeded
-  // with the average DC ambient of their 6 axis-neighbours. Runs after
-  // integrate; reads probeSH/probeDepth in place. Only band 0 is seeded —
-  // higher bands stay zero, which makes trapped probes contribute pure
-  // ambient (no directional information) and the Chebyshev test in the
-  // fragment shader still culls them correctly because their depth moments
-  // remain set to "very close" from being inside geometry.
+  // Neighbour-seed pass: trapped probes (probeDepth.w == 1.0) get their oct
+  // map filled by averaging the corresponding texel across their 6 axis-
+  // neighbours. This lets a trapped probe still contribute *something* to the
+  // GI blend if all 8 of its trilinear cage cellmates happen to be trapped —
+  // it gets a soft directional ambient from neighbours instead of zero.
+  // Healthy probes are untouched.
   const SEED_WGSL = /* wgsl */`
 struct SeedUniforms {
   dims: vec4<u32>,    // xyz=probe dims, w=numProbes
 };
 @group(0) @binding(0) var<uniform> U: SeedUniforms;
-@group(0) @binding(1) var<storage, read_write> probeSH:    array<vec4<f32>>;
+@group(0) @binding(1) var<storage, read_write> probeOct:   array<vec4<f32>>;  // 64 vec4/probe
 @group(0) @binding(2) var<storage, read>       probeDepth: array<vec4<f32>>;
+
+const OCT_TEX: u32 = 64u;
 
 fn flatIdx(x: i32, y: i32, z: i32) -> i32 {
   let dx = i32(U.dims.x);
@@ -2327,38 +2406,37 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let dx = i32(U.dims.x);
   let dy = i32(U.dims.y);
   let dz = i32(U.dims.z);
-  // Decompose flat probeIdx -> (x,y,z) using the layout
-  // flatIdx = z*dx*dy + y*dx + x.
   let z = i32(probeIdx) / (dx * dy);
   let y = (i32(probeIdx) - z * dx * dy) / dx;
   let x = i32(probeIdx) - z * dx * dy - y * dx;
 
-  var sum = vec3<f32>(0.0);
-  var count = 0.0;
-  // 6 axis-neighbours.
   let off = array<vec3<i32>, 6>(
     vec3<i32>(-1, 0, 0), vec3<i32>(1, 0, 0),
     vec3<i32>(0, -1, 0), vec3<i32>(0, 1, 0),
     vec3<i32>(0, 0, -1), vec3<i32>(0, 0, 1)
   );
-  for (var i: u32 = 0u; i < 6u; i = i + 1u) {
-    let o = off[i];
-    let nx = x + o.x;
-    let ny = y + o.y;
-    let nz = z + o.z;
-    if (nx < 0 || nx >= dx) { continue; }
-    if (ny < 0 || ny >= dy) { continue; }
-    if (nz < 0 || nz >= dz) { continue; }
-    let nIdx = flatIdx(nx, ny, nz);
-    if (probeDepth[nIdx].w > 0.5) { continue; } // skip other trapped probes
-    sum = sum + probeSH[u32(nIdx) * 9u].xyz;    // band-0 only
-    count = count + 1.0;
+
+  // For each oct texel, average the same texel from up to 6 healthy neighbours.
+  for (var t: u32 = 0u; t < OCT_TEX; t = t + 1u) {
+    var sum = vec3<f32>(0.0);
+    var count = 0.0;
+    for (var i: u32 = 0u; i < 6u; i = i + 1u) {
+      let o = off[i];
+      let nx = x + o.x;
+      let ny = y + o.y;
+      let nz = z + o.z;
+      if (nx < 0 || nx >= dx) { continue; }
+      if (ny < 0 || ny >= dy) { continue; }
+      if (nz < 0 || nz >= dz) { continue; }
+      let nIdx = flatIdx(nx, ny, nz);
+      if (probeDepth[nIdx].w > 0.5) { continue; }
+      sum = sum + probeOct[u32(nIdx) * OCT_TEX + t].xyz;
+      count = count + 1.0;
+    }
+    if (count > 0.0) {
+      probeOct[probeIdx * OCT_TEX + t] = vec4<f32>(sum / count, 0.0);
+    }
   }
-  if (count > 0.0) {
-    let avg = sum / count;
-    probeSH[probeIdx * 9u] = vec4<f32>(avg, 0.0);
-  }
-  // Higher bands stay zeroed from the integrate pass — gives pure ambient.
 }
 `;
 
@@ -2420,7 +2498,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
       { binding: 3, resource: { buffer: triBuf } },
       { binding: 4, resource: { buffer: triMatBuf } },
       { binding: 5, resource: { buffer: probePosBuf } },
-      { binding: 6, resource: { buffer: probeSHBuf } },
+      { binding: 6, resource: { buffer: probeOctBuf } },
       { binding: 7, resource: { buffer: rayHitsBuf } },
     ],
   });
@@ -2447,7 +2525,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     entries: [
       { binding: 0, resource: { buffer: intUniBuf } },
       { binding: 1, resource: { buffer: rayHitsBuf } },
-      { binding: 2, resource: { buffer: probeSHBuf } },
+      { binding: 2, resource: { buffer: probeOctBuf } },
       { binding: 3, resource: { buffer: probeDepthBuf } },
     ],
   });
@@ -2456,18 +2534,27 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     layout: seedPipeline.getBindGroupLayout(0),
     entries: [
       { binding: 0, resource: { buffer: seedUniBuf } },
-      { binding: 1, resource: { buffer: probeSHBuf } },
+      { binding: 1, resource: { buffer: probeOctBuf } },
       { binding: 2, resource: { buffer: probeDepthBuf } },
     ],
   });
 
-  // ---------- TSL fragment graph (reuses the existing trilinear-SH path) ----------
-  // We allocate the SH and depth uniformArrays the same way createWebGPUScene
-  // does; the only difference is they're populated by the RT pipeline above
-  // instead of CPU-integrated cubemaps.
-  const SH_COEFFS = 9;
-  const probeSHFlat = [];
-  for (let i = 0; i < PROBE_COUNT * SH_COEFFS; i++) probeSHFlat.push(new THREE.Vector3());
+  // ---------- TSL fragment graph (octahedral 8×8 per probe) ----------
+  // Each probe's irradiance lives in an 8×8 RGBA-float texel block. We pack
+  // all PROBE_COUNT blocks horizontally into a single 2D DataTexture of size
+  // (PROBE_COUNT * 8, 8). Blob k is at columns [k*8 .. k*8+8). Probe lookup
+  // = sample 4 texels manually for bilinear within the probe's tile (a real
+  // bilinear sampler would bleed across probe tile boundaries).
+  const OCT_TEX_W = PROBE_COUNT * OCT_RES; // 2744 for 343 probes
+  const OCT_TEX_H = OCT_RES;                // 8
+  const probeOctData = new Float32Array(OCT_TEX_W * OCT_TEX_H * 4);
+  const probeOctTex = new THREE.DataTexture(probeOctData, OCT_TEX_W, OCT_TEX_H, THREE.RGBAFormat, THREE.FloatType);
+  probeOctTex.minFilter = THREE.NearestFilter;
+  probeOctTex.magFilter = THREE.NearestFilter;
+  probeOctTex.wrapS = THREE.ClampToEdgeWrapping;
+  probeOctTex.wrapT = THREE.ClampToEdgeWrapping;
+  probeOctTex.needsUpdate = true;
+
   const probeDepthMeanArr   = new Array(PROBE_COUNT).fill(100.0);
   const probeDepthMeanSqArr = new Array(PROBE_COUNT).fill(10000.0);
 
@@ -2476,7 +2563,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let uChebyshevEnabled, uDepthBias, uChebyshevFloor;
   bc('building TSL GI graph');
   try {
-    const { Fn, vec3, float, int, uniform, uniformArray, positionWorld, normalWorld } = TSL;
+    const { Fn, vec3, vec2, float, int, uniform, uniformArray, texture, positionWorld, normalWorld } = TSL;
     uProbeMin    = uniform(PROBE_MIN.clone());
     uProbeMax    = uniform(PROBE_MAX.clone());
     uProbeDims   = uniform(PROBE_DIMS.clone());
@@ -2488,34 +2575,61 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     uGiEnabled   = uniform(1.0);
     uGiMode      = uniform(5.0);
     uGiPiFactor  = uniform(1.0);
-    uGiTransportMode = uniform(2); // diffuse irradiance — the engine path
+    uGiTransportMode = uniform(2);
 
-    const probeSHArray  = uniformArray(probeSHFlat, 'vec3');
+    const uOctTex       = texture(probeOctTex);
     const uDepthMean    = uniformArray(probeDepthMeanArr, 'float');
     const uDepthMeanSq  = uniformArray(probeDepthMeanSqArr, 'float');
-    // Per-probe trapped flag (0 = healthy, 1 = inside/grazing geometry). Used
-    // in the trilinear loop to zero a buried probe's contribution.
     probeTrappedFloatArr = new Array(PROBE_COUNT).fill(0.0);
     const uProbeTrapped = uniformArray(probeTrappedFloatArr, 'float');
     uChebyshevEnabled   = uniform(1.0);
     uDepthBias          = uniform(0.12);
     uChebyshevFloor     = uniform(0.0);
 
-    const readSH = (pi, k) => probeSHArray.element(int(pi).mul(int(9)).add(int(k)));
-    const evalSH = (n, pi) => {
-      const x = n.x, y = n.y, z = n.z;
-      const c0 = readSH(pi, 0), c1 = readSH(pi, 1), c2 = readSH(pi, 2);
-      const c3 = readSH(pi, 3), c4 = readSH(pi, 4), c5 = readSH(pi, 5);
-      const c6 = readSH(pi, 6), c7 = readSH(pi, 7), c8 = readSH(pi, 8);
-      return c0.mul(0.886227)
-        .add(c1.mul(2.0 * 0.511664).mul(y))
-        .add(c2.mul(2.0 * 0.511664).mul(z))
-        .add(c3.mul(2.0 * 0.511664).mul(x))
-        .add(c4.mul(2.0 * 0.429043).mul(x).mul(y))
-        .add(c5.mul(2.0 * 0.429043).mul(y).mul(z))
-        .add(c6.mul(z.mul(z).mul(0.743125).sub(0.247708)))
-        .add(c7.mul(2.0 * 0.429043).mul(x).mul(z))
-        .add(c8.mul(0.429043).mul(x.mul(x).sub(y.mul(y))));
+    const TEX_W = float(OCT_TEX_W);
+    const TEX_H = float(OCT_TEX_H);
+    const OCT_F = float(OCT_RES);
+
+    // Octahedral encode: unit direction -> [0..1]^2 within a single probe tile.
+    const octEncode = (n) => {
+      const an = n.abs();
+      const sum = an.x.add(an.y).add(an.z).max(float(1e-6));
+      const p   = vec2(n.x.div(sum), n.y.div(sum));
+      // If z<0 fold to corners (matches WGSL octEncode used in the bake).
+      const folded = vec2(
+        float(1.0).sub(p.y.abs()).mul(p.x.greaterThanEqual(float(0.0)).mix(float(-1.0), float(1.0)).negate()),
+        float(1.0).sub(p.x.abs()).mul(p.y.greaterThanEqual(float(0.0)).mix(float(-1.0), float(1.0)).negate())
+      );
+      const uv = n.z.lessThan(float(0.0)).mix(p, folded);
+      return uv.mul(0.5).add(0.5); // 0..1
+    };
+
+    // Read a single oct texel (no filtering) for probe pi at integer texel
+    // (tx, ty) ∈ [0..7]^2. The texture x-coord = pi * 8 + tx + 0.5.
+    const fetchOctTexel = (pi, tx, ty) => {
+      const u = pi.mul(OCT_F).add(tx).add(0.5).div(TEX_W);
+      const v = ty.add(0.5).div(TEX_H);
+      return uOctTex.sample(vec2(u, v)).rgb;
+    };
+
+    // Bilinear-blend 4 texels within a single probe's tile. We do it
+    // manually so the blend never crosses into a neighbouring probe's tile
+    // (which would happen with a hardware linear filter at the seam).
+    const sampleProbeOct = (pi, n) => {
+      const uv  = octEncode(n).mul(OCT_F).sub(0.5);
+      const x0  = uv.x.floor().clamp(0.0, OCT_RES - 1);
+      const y0  = uv.y.floor().clamp(0.0, OCT_RES - 1);
+      const x1  = x0.add(1.0).min(float(OCT_RES - 1));
+      const y1  = y0.add(1.0).min(float(OCT_RES - 1));
+      const fx  = uv.x.sub(x0).clamp(0.0, 1.0);
+      const fy  = uv.y.sub(y0).clamp(0.0, 1.0);
+      const c00 = fetchOctTexel(pi, x0, y0);
+      const c10 = fetchOctTexel(pi, x1, y0);
+      const c01 = fetchOctTexel(pi, x0, y1);
+      const c11 = fetchOctTexel(pi, x1, y1);
+      const cx0 = c00.mix(c10, fx);
+      const cx1 = c01.mix(c11, fx);
+      return cx0.mix(cx1, fy);
     };
 
     const giSampleFn = Fn(([wp, n]) => {
@@ -2551,32 +2665,13 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         const dMeanSq    = uDepthMeanSq.element(piInt);
         const variance   = dMeanSq.sub(dMean.mul(dMean)).max(float(1e-4));
         const distExcess = dist.sub(dMean).max(float(0.0));
-        // Square Chebyshev to sharpen partial-visibility falloff.
         const chebyshevRaw = variance.div(variance.add(distExcess.mul(distExcess))).clamp(0.0, 1.0);
         const chebyshev    = chebyshevRaw.mul(chebyshevRaw);
         const visWeight  = uChebyshevFloor.mix(chebyshev, uChebyshevEnabled).max(uChebyshevFloor);
-        // Hard trap mask: trapped probes contribute zero. Apply *after* the
-        // per-corner floor so the floor doesn't pull the weight back up.
         const trappedFlag = uProbeTrapped.element(piInt);
         const aliveMask   = float(1.0).sub(trappedFlag);
         const weight     = triWeight.mul(visWeight).max(float(1e-5)).mul(aliveMask);
-        // No X mirror here — the RT projection in INTEGRATE_WGSL uses
-        // world-space fibSphere directions directly, so reconstruction must
-        // also use the unmodified surface normal. (The legacy webgpu scene
-        // mirrors X to compensate for the cube-camera face convention; that
-        // path doesn't apply when the projection is done analytically.)
-        const irrRaw  = evalSH(n, pi);
-        const c0Amb   = readSH(pi, 0).mul(0.886227).max(vec3(0.0));
-        // Chromaticity-aware ringing detector: only blend back to DC ambient
-        // when the negative magnitude is large *relative to the strongest
-        // positive channel*. A weak negative (~SH discreteness) beside a
-        // strong positive (legitimate bleed) is normal — desaturating it
-        // crushes colored bleed into gray.
-        const maxCh   = irrRaw.x.max(irrRaw.y).max(irrRaw.z).max(float(1e-3));
-        const minCh   = irrRaw.x.min(irrRaw.y).min(irrRaw.z);
-        const negDepth= minCh.negate().max(float(0.0));
-        const ringing = negDepth.div(maxCh).clamp(float(0.0), float(1.0));
-        const irr     = irrRaw.max(vec3(0.0)).mix(c0Amb, ringing);
+        const irr = sampleProbeOct(pi, n).max(vec3(0.0));
         sum  = sum.add(irr.mul(weight));
         wSum = wSum.add(weight);
       }
@@ -2636,7 +2731,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
       pass.dispatchWorkgroups(Math.ceil(PROBE_COUNT / 64));
       pass.end();
     }
-    enc.copyBufferToBuffer(probeSHBuf, 0, probeSHReadBuf, 0, probeSHBufBytes);
+    enc.copyBufferToBuffer(probeOctBuf, 0, probeOctReadBuf, 0, probeOctBufBytes);
     enc.copyBufferToBuffer(probeDepthBuf, 0, probeDepthReadBuf, 0, PROBE_COUNT * 16);
     // Debug: copy every probe's rays into the staging buffer for full-scene
     // ray visualization.
@@ -2644,16 +2739,19 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     device.queue.submit([enc.finish()]);
 
     await Promise.all([
-      probeSHReadBuf.mapAsync(GPUMapMode.READ),
+      probeOctReadBuf.mapAsync(GPUMapMode.READ),
       probeDepthReadBuf.mapAsync(GPUMapMode.READ),
       debugRayReadBuf.mapAsync(GPUMapMode.READ),
     ]);
-    const shView = new Float32Array(probeSHReadBuf.getMappedRange());
+    const octView = new Float32Array(probeOctReadBuf.getMappedRange());
     const dView  = new Float32Array(probeDepthReadBuf.getMappedRange());
     for (let p = 0; p < PROBE_COUNT; p++) {
-      for (let k = 0; k < 9; k++) {
-        const off = (p * 9 + k) * 4;
-        probeSHFlat[p * 9 + k].set(shView[off+0], shView[off+1], shView[off+2]);
+      const probeSrc = p * OCT_TEXELS * 4;
+      const probeDstX = p * OCT_RES;
+      for (let ty = 0; ty < OCT_RES; ty++) {
+        const srcOff = probeSrc + ty * OCT_RES * 4;
+        const dstOff = (ty * OCT_TEX_W + probeDstX) * 4;
+        probeOctData.set(octView.subarray(srcOff, srcOff + OCT_RES * 4), dstOff);
       }
       probeDepthMeanArr[p]   = dView[p * 4 + 0];
       probeDepthMeanSqArr[p] = dView[p * 4 + 1];
@@ -2661,15 +2759,78 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
       probeTrappedFlags[p]   = trapped;
       if (probeTrappedFloatArr) probeTrappedFloatArr[p] = trapped ? 1.0 : 0.0;
     }
+    probeOctTex.needsUpdate = true;
     // Debug: pull every probe's rays and rebuild the line visualization.
     const rayView = new Float32Array(debugRayReadBuf.getMappedRange());
     const debugRays = new Float32Array(rayView); // copy out before unmap
     debugRayReadBuf.unmap();
-    probeSHReadBuf.unmap();
+    probeOctReadBuf.unmap();
     probeDepthReadBuf.unmap();
     stats.totalProbeUpdates += PROBE_COUNT;
     updateDebugProbeColors();
     updateDebugRayLines(debugRays, frameSeed);
+    relocateProbes(debugRays, frameSeed);
+  }
+
+  // Probe relocation: nudge each probe away from nearby geometry by averaging
+  // the directions of rays that hit *backfaces* (meaning the probe is buried
+  // in or grazing a wall in those directions). Push opposite to that average
+  // by a small step, clamp drift to half the cell spacing, then re-upload the
+  // position buffer so the next RT pass traces from the new positions. Over
+  // a handful of bakes, trapped probes converge to free space — same idea as
+  // the relocation step in the original DDGI paper.
+  const _relocTmp = new THREE.Vector3();
+  function relocateProbes(rayData, frameSeed) {
+    const stepBuf = probePosBuf32; // we reuse the existing GPU upload buffer
+    let movedAny = false;
+    for (let p = 0; p < PROBE_COUNT; p++) {
+      const probeRayBase = p * RAYS_PER_PROBE * 4;
+      const seed = frameSeed + p * 0.61803;
+      let pushX = 0, pushY = 0, pushZ = 0;
+      let weightSum = 0;
+      for (let i = 0; i < RAYS_PER_PROBE; i++) {
+        const signedDist = rayData[probeRayBase + i * 4 + 3];
+        // RT pass encodes backface as negative signed distance.
+        if (signedDist >= 0) continue;
+        const hitDist = -signedDist;
+        const dir = fibSphereJS(i, RAYS_PER_PROBE, seed);
+        // Closer backfaces push harder (1/dist falls off, capped). All
+        // backfaces contribute — a probe on a cube face has a long backface
+        // ray across the cube interior, which still indicates the probe is
+        // wrong-side of that wall and should drift away from that direction.
+        const w = 1.0 / Math.max(hitDist, 0.05);
+        pushX -= dir[0] * w; // away from the backface direction
+        pushY -= dir[1] * w;
+        pushZ -= dir[2] * w;
+        weightSum += w;
+      }
+      if (weightSum < 1e-3) continue;
+      // Normalise the average and step a fraction of probe spacing.
+      const invW = 1.0 / weightSum;
+      pushX *= invW; pushY *= invW; pushZ *= invW;
+      const len = Math.sqrt(pushX*pushX + pushY*pushY + pushZ*pushZ);
+      if (len < 1e-3) continue;
+      const stepLen = MAX_PROBE_OFFSET * RELOCATION_STEP;
+      const nx = pushX / len * stepLen;
+      const ny = pushY / len * stepLen;
+      const nz = pushZ / len * stepLen;
+      const off = probeOffsets[p];
+      _relocTmp.set(off.x + nx, off.y + ny, off.z + nz);
+      // Clamp the cumulative offset to a sphere of radius MAX_PROBE_OFFSET.
+      const offLen = _relocTmp.length();
+      if (offLen > MAX_PROBE_OFFSET) _relocTmp.multiplyScalar(MAX_PROBE_OFFSET / offLen);
+      off.copy(_relocTmp);
+      // Apply: physical = home + offset.
+      const home = probeHomePositions[p];
+      probePositions[p].set(home.x + off.x, home.y + off.y, home.z + off.z);
+      stepBuf[p * 4 + 0] = probePositions[p].x;
+      stepBuf[p * 4 + 1] = probePositions[p].y;
+      stepBuf[p * 4 + 2] = probePositions[p].z;
+      // Move the debug sphere too so probe visualization reflects the drift.
+      if (debugSpheres[p]) debugSpheres[p].position.copy(probePositions[p]);
+      movedAny = true;
+    }
+    if (movedAny) device.queue.writeBuffer(probePosBuf, 0, stepBuf);
   }
 
   // Mirror of WGSL fibSphere — must produce identical directions per ray.
@@ -2874,7 +3035,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
       gui.destroy();
       controls.dispose();
       [bvhNodeBuf, bvhIdxBuf, triBuf, triMatBuf, probePosBuf, rayHitsBuf,
-       probeSHBuf, probeDepthBuf, probeSHReadBuf, probeDepthReadBuf,
+       probeOctBuf, probeDepthBuf, probeOctReadBuf, probeDepthReadBuf,
        rtUniBuf, intUniBuf, seedUniBuf].forEach(b => { try { b.destroy(); } catch (e) { /* ok */ } });
       scene.traverse(o => {
         if (o.geometry) o.geometry.dispose();
