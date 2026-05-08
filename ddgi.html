@@ -159,7 +159,12 @@ async function loadWebGPUImports() {
 // ---------- shared constants ----------
 const BOX = { x: 1.0, y: 1.0, z: 1.0 };
 const PROBE_DIMS = new THREE.Vector3(7, 7, 7);
-const PROBE_MIN  = new THREE.Vector3(-BOX.x * 0.85, 0.15,            -BOX.z * 0.85);
+// Floor-side bottom slice lifted from 0.15 → 0.30: the lower probes were
+// spending ~30% of their hemisphere on self-floor hits, washing the SH band-0
+// to white from the panel reflection on the floor and crushing the colored
+// wall contribution. At 0.30 the floor probes have more clear-line-of-sight
+// to the side walls, so red/green bleed survives in the SH bands.
+const PROBE_MIN  = new THREE.Vector3(-BOX.x * 0.85, 0.30,            -BOX.z * 0.85);
 const PROBE_MAX  = new THREE.Vector3( BOX.x * 0.85, 2*BOX.y - 0.15,   BOX.z * 0.85);
 const PROBE_COUNT = PROBE_DIMS.x * PROBE_DIMS.y * PROBE_DIMS.z;
 
@@ -1509,13 +1514,18 @@ async function createWebGPURTScene(canvas) {
   { const m = makeQuad(2*BOX.x, 2*BOX.z, matWhite, MAT_WHITE); m.rotation.x = -Math.PI/2; cornell.add(m); }
   { const m = makeQuad(2*BOX.x, 2*BOX.z, matWhite, MAT_WHITE); m.rotation.x =  Math.PI/2; m.position.y = 2*BOX.y; cornell.add(m); }
   { const m = makeQuad(2*BOX.x, 2*BOX.y, matWhite, MAT_WHITE); m.position.set(0, BOX.y, -BOX.z); cornell.add(m); }
+  // Front wall — rotated 180° so its outward normal points -Z (into the
+  // camera). When the user orbits to the back, the camera now sees a wall
+  // closing the room instead of the void. The BVH treats it as a normal
+  // occluder so it correctly blocks light to/from outside the box.
+  { const m = makeQuad(2*BOX.x, 2*BOX.y, matWhite, MAT_WHITE); m.rotation.y = Math.PI; m.position.set(0, BOX.y, BOX.z); cornell.add(m); }
   { const m = makeQuad(2*BOX.z, 2*BOX.y, matRed,   MAT_RED);   m.rotation.y =  Math.PI/2; m.position.set(-BOX.x, BOX.y, 0); cornell.add(m); }
   { const m = makeQuad(2*BOX.z, 2*BOX.y, matGreen, MAT_GREEN); m.rotation.y = -Math.PI/2; m.position.set( BOX.x, BOX.y, 0); cornell.add(m); }
 
   // Emissive ceiling panel — its triangles will get matId=MAT_PANEL inside the
   // BVH and the RT shader treats them as light sources for direct illumination.
   const lightPanelMat = new MeshBasicNodeMaterial({ color: 0xffffff });
-  const uPanelColor = TSL.uniform(new THREE.Vector3(4.0, 4.0, 3.5));
+  const uPanelColor = TSL.uniform(new THREE.Vector3(2.5, 2.5, 2.2));
   lightPanelMat.colorNode  = uPanelColor;
   lightPanelMat.toneMapped = false;
   const lightPanel = tagMat(new THREE.Mesh(new THREE.PlaneGeometry(0.55, 0.45), lightPanelMat), MAT_PANEL);
@@ -1524,7 +1534,7 @@ async function createWebGPURTScene(canvas) {
   cornell.add(lightPanel);
 
   // Direct point light (analytic in the RT shader — see RT_WGSL below).
-  const keyLight = new THREE.PointLight(0xfff8e8, 2.5, 0, 1.0);
+  const keyLight = new THREE.PointLight(0xfff8e8, 1.0, 0, 1.0);
   keyLight.position.set(0, 2*BOX.y - 0.05, 0);
   scene.add(keyLight);
   const hemiLight = new THREE.HemisphereLight(0xfff8e8, 0x202028, 0.25);
