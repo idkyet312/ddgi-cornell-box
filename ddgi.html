@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8" />
-<title>DDGI Cornell Box — WebGL & WebGPU</title>
+<title>DDGI Test Scenes — WebGL & WebGPU</title>
 <style>
   html, body { margin: 0; padding: 0; overflow: hidden; background: #000; color: #eee; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
   #scene-picker {
@@ -49,10 +49,12 @@
 <div id="scene-picker">
   <button data-scene="webgl" class="active">WebGL · basic</button>
   <button data-scene="webgpu">WebGPU · depth-aware</button>
+  <button data-scene="webgpu-simple">WebGPU · simple test</button>
+  <button data-scene="webgpu-rt">WebGPU · raytraced</button>
 </div>
 
 <div id="info">
-  <b>DDGI Cornell Box</b>
+  <b>DDGI Test Scenes</b>
   <span class="tag" id="tag-mode">three.js · WebGL</span>
   <div id="info-body" style="margin-top:6px; opacity:0.85;"></div>
   <div style="margin-top:6px; opacity:0.7;">Drag to orbit · scroll to zoom</div>
@@ -130,7 +132,8 @@
     "three":            "https://cdn.jsdelivr.net/npm/three@0.172.0/build/three.module.js",
     "three/webgpu":     "https://cdn.jsdelivr.net/npm/three@0.172.0/build/three.webgpu.js",
     "three/tsl":        "https://cdn.jsdelivr.net/npm/three@0.172.0/build/three.tsl.js",
-    "three/addons/":    "https://cdn.jsdelivr.net/npm/three@0.172.0/examples/jsm/"
+    "three/addons/":    "https://cdn.jsdelivr.net/npm/three@0.172.0/examples/jsm/",
+    "three-mesh-bvh":   "https://cdn.jsdelivr.net/npm/three-mesh-bvh@0.7.8/+esm"
   }
 }
 </script>
@@ -155,7 +158,7 @@ async function loadWebGPUImports() {
 
 // ---------- shared constants ----------
 const BOX = { x: 1.0, y: 1.0, z: 1.0 };
-const PROBE_DIMS = new THREE.Vector3(4, 4, 4);
+const PROBE_DIMS = new THREE.Vector3(7, 7, 7);
 const PROBE_MIN  = new THREE.Vector3(-BOX.x * 0.85, 0.15,            -BOX.z * 0.85);
 const PROBE_MAX  = new THREE.Vector3( BOX.x * 0.85, 2*BOX.y - 0.15,   BOX.z * 0.85);
 const PROBE_COUNT = PROBE_DIMS.x * PROBE_DIMS.y * PROBE_DIMS.z;
@@ -174,11 +177,19 @@ let currentSceneKey = null;
 const sceneInfos = {
   webgl: {
     tag: 'three.js · WebGL',
-    body: 'A 4×4×4 grid of irradiance probes captures the scene via cubemap renders, converts to L2 spherical harmonics, and is blended trilinearly per fragment to add indirect light.'
+    body: 'A 3×3×3 grid of irradiance probes captures the scene via cubemap renders, converts to L2 spherical harmonics, and is blended trilinearly per fragment to add indirect light.'
   },
   webgpu: {
     tag: 'three.js · WebGPU · GI (uniformArray)',
-    body: 'WebGPU + NodeMaterials + DDGI. SH coefficients exposed via TSL uniformArray (skipping the failing DataTexture upload path). 4×4×4 probe grid, manual SH integration on CPU, trilinear blend per fragment via TSL Fn. Diagnostic dropdown still available — switch to mode 4 to verify probe[0] data is reaching the shader.'
+    body: 'WebGPU + NodeMaterials + DDGI. SH coefficients exposed via TSL uniformArray (skipping the failing DataTexture upload path). 3×3×3 probe grid, manual SH integration on CPU, trilinear blend per fragment via TSL Fn. Diagnostic dropdown still available — switch to mode 4 to verify probe[0] data is reaching the shader.'
+  },
+  'webgpu-simple': {
+    tag: 'three.js · WebGPU · GI test room',
+    body: 'A simpler DDGI room for debugging bounce light: the same 3×3×3 WebGPU probe grid, but with one centered white box instead of the full Cornell-box clutter. Easier to read probe leakage, wall tint, and rebake behavior.'
+  },
+  'webgpu-rt': {
+    tag: 'three.js · WebGPU · raytraced DDGI',
+    body: 'Probe capture replaced with a WGSL compute shader that traces 64 rays per probe against a three-mesh-bvh BVH. SH coefficients + depth moments are integrated on the GPU. The room is intentionally simplified to one centered box so probe trapping, leakage, and bounce tint are easier to read while keeping the same raytraced DDGI path.'
   }
 };
 
@@ -238,6 +249,10 @@ async function loadScene(key) {
       currentSceneInstance = await createWebGLScene(canvas);
     } else if (key === 'webgpu') {
       currentSceneInstance = await createWebGPUScene(canvas);
+    } else if (key === 'webgpu-simple') {
+      currentSceneInstance = await createWebGPUScene(canvas, { preset: 'simple' });
+    } else if (key === 'webgpu-rt') {
+      currentSceneInstance = await createWebGPURTScene(canvas);
     }
     currentSceneKey = key;
     setStatus('');
@@ -266,9 +281,10 @@ document.querySelectorAll('#scene-picker button').forEach(b => {
 
 // detect WebGPU support
 if (!('gpu' in navigator)) {
-  const btn = document.querySelector('button[data-scene="webgpu"]');
-  btn.disabled = true;
-  btn.title = 'WebGPU not available in this browser';
+  document.querySelectorAll('button[data-scene^="webgpu"]').forEach(btn => {
+    btn.disabled = true;
+    btn.title = 'WebGPU not available in this browser';
+  });
 }
 
 // ---------- helper: shared FPS / probe-count tracking ----------
@@ -290,14 +306,17 @@ class Stats {
 // Just renderer + Cornell box + direct lighting. No probes, no GI yet.
 // We add features in subsequent phases once this is verified working.
 // ============================================================
-async function createWebGPUScene(canvas) {
+async function createWebGPUScene(canvas, options = {}) {
   if (!navigator.gpu) throw new Error('WebGPU not available in this browser.');
+
+  const scenePreset = options.preset === 'simple' ? 'simple' : 'cornell';
+  const simpleScene = scenePreset === 'simple';
 
   bc('createWebGPUScene start');
 
   // Lazy-load WebGPU/TSL bundles
   bc('loading three/webgpu + three/tsl…');
-  const { WebGPURenderer, MeshStandardNodeMaterial, MeshBasicNodeMaterial, TSL } = await loadWebGPUImports();
+  const { WebGPURenderer, MeshStandardNodeMaterial, MeshBasicNodeMaterial, IrradianceNode, TSL } = await loadWebGPUImports();
   bc('imports loaded');
 
   bc('constructing WebGPURenderer');
@@ -315,6 +334,27 @@ async function createWebGPUScene(canvas) {
   const scene = new THREE.Scene();
   scene.background = new THREE.Color(0x000000);
 
+  class DDGIMeshStandardNodeMaterial extends MeshStandardNodeMaterial {
+    constructor(parameters) {
+      super(parameters);
+      this.ddgiIrradianceNode = null;
+    }
+
+    setupLightMap(builder) {
+      if (this.ddgiIrradianceNode) {
+        return new IrradianceNode(this.ddgiIrradianceNode);
+      }
+
+      return super.setupLightMap(builder);
+    }
+
+    copy(source) {
+      super.copy(source);
+      this.ddgiIrradianceNode = source.ddgiIrradianceNode;
+      return this;
+    }
+  }
+
   const camera = new THREE.PerspectiveCamera(45, window.innerWidth/window.innerHeight, 0.05, 100);
   camera.position.set(0, 1.0, 3.6);
 
@@ -324,19 +364,24 @@ async function createWebGPUScene(canvas) {
   controls.minDistance = 1.2;
   controls.maxDistance = 8;
 
-  bc('building Cornell box');
+  if (simpleScene) {
+    camera.position.set(0, 0.95, 3.0);
+    controls.target.set(0, 0.65, 0.05);
+  }
+
+  bc(simpleScene ? 'building simple DDGI test room' : 'building Cornell box');
 
   const cornell = new THREE.Group();
   scene.add(cornell);
 
   const wallMat = (color) =>
-    new MeshStandardNodeMaterial({ color, roughness: 1.0, metalness: 0.0 });
+    new DDGIMeshStandardNodeMaterial({ color, roughness: 1.0, metalness: 0.0 });
   const matWhite = wallMat(0xeeeeee);
   const matRed   = wallMat(0xcc2828);
   const matGreen = wallMat(0x28a828);
 
-  const WALL_SEGMENTS = 96;
-  const BOX_SEGMENTS = 28;
+  const WALL_SEGMENTS = simpleScene ? 1 : 96;
+  const BOX_SEGMENTS = 1;
   const makeQuad = (w,h,m) => new THREE.Mesh(new THREE.PlaneGeometry(w, h, WALL_SEGMENTS, WALL_SEGMENTS), m);
   const boxWireframes = [];
   const addBoxWireframe = (mesh) => {
@@ -359,13 +404,13 @@ async function createWebGPUScene(canvas) {
   { const m = makeQuad(2*BOX.z, 2*BOX.y, matRed);   m.rotation.y =  Math.PI/2; m.position.set(-BOX.x, BOX.y, 0); cornell.add(m); }
   { const m = makeQuad(2*BOX.z, 2*BOX.y, matGreen); m.rotation.y = -Math.PI/2; m.position.set( BOX.x, BOX.y, 0); cornell.add(m); }
 
-  // emissive ceiling panel
+  // emissive ceiling panel — exposed as a uniform so the GUI can retune live.
   const lightPanelMat = new MeshBasicNodeMaterial({ color: 0xffffff });
-  // Try setting colorNode as a plain TSL vec3. This is one of the things we want to test.
+  const uPanelColor = TSL.uniform(new THREE.Vector3(8.0, 8.0, 7.0));
   try {
-    lightPanelMat.colorNode = TSL.vec3(8.0, 8.0, 7.0);
+    lightPanelMat.colorNode = uPanelColor;
     lightPanelMat.toneMapped = false;
-    bc('lightPanel.colorNode = vec3 OK');
+    bc('lightPanel.colorNode = uniform OK');
   } catch (e) {
     bc('lightPanel.colorNode failed: ' + e.message);
   }
@@ -384,32 +429,54 @@ async function createWebGPUScene(canvas) {
   // Compensate by reducing PointLight intensity to a value that approximates the
   // RectAreaLight's hemispherical flux. 2.5 was tuned empirically against the WebGL
   // reference at intensity 1.0 with /π applied.
-  const keyLight = new THREE.PointLight(0xfff8e8, 2.5, 0, 1.4);
+  const keyLight = new THREE.PointLight(0xfff8e8, 2.5, 0, 1.0);
   keyLight.position.set(0, 2*BOX.y - 0.05, 0);
   scene.add(keyLight);
 
-  const tallBox = new THREE.Mesh(new THREE.BoxGeometry(0.55, 1.1, 0.55, BOX_SEGMENTS, BOX_SEGMENTS * 2, BOX_SEGMENTS), matWhite);
-  tallBox.position.set(-0.3, 0.55, -0.3);
-  tallBox.rotation.y = THREE.MathUtils.degToRad(18);
-  addBoxWireframe(tallBox);
-  cornell.add(tallBox);
+  // HemisphereLight as a soft fill: vertical surfaces (box sides, walls)
+  // would otherwise receive almost no direct light from the ceiling
+  // PointLight, leaving them black until indirect bounce kicks in. The sky
+  // colour matches the panel and the ground colour is a dim cool grey, so
+  // this acts as a cheap surrogate for the bounce floor + ceiling that DDGI
+  // will refine on top.
+  const hemiLight = new THREE.HemisphereLight(0xfff8e8, 0x202028, 0.25);
+  hemiLight.position.set(0, 2*BOX.y, 0);
+  scene.add(hemiLight);
 
-  const shortBox = new THREE.Mesh(new THREE.BoxGeometry(0.55, 0.55, 0.55, BOX_SEGMENTS, BOX_SEGMENTS, BOX_SEGMENTS), matWhite);
-  shortBox.position.set(0.32, 0.275, 0.28);
-  shortBox.rotation.y = THREE.MathUtils.degToRad(-18);
-  addBoxWireframe(shortBox);
-  cornell.add(shortBox);
+  if (simpleScene) {
+    const centerBox = new THREE.Mesh(new THREE.BoxGeometry(0.75, 0.75, 0.75, BOX_SEGMENTS, BOX_SEGMENTS, BOX_SEGMENTS), matWhite);
+    centerBox.position.set(0, 0.375, 0.1);
+    centerBox.rotation.y = THREE.MathUtils.degToRad(26);
+    addBoxWireframe(centerBox);
+    cornell.add(centerBox);
+  } else {
+    const tallBox = new THREE.Mesh(new THREE.BoxGeometry(0.55, 1.1, 0.55, BOX_SEGMENTS, BOX_SEGMENTS * 2, BOX_SEGMENTS), matWhite);
+    tallBox.position.set(-0.3, 0.55, -0.3);
+    tallBox.rotation.y = THREE.MathUtils.degToRad(18);
+    addBoxWireframe(tallBox);
+    cornell.add(tallBox);
 
-  bc('Cornell box built');
+    const shortBox = new THREE.Mesh(new THREE.BoxGeometry(0.55, 0.55, 0.55, BOX_SEGMENTS, BOX_SEGMENTS, BOX_SEGMENTS), matWhite);
+    shortBox.position.set(0.32, 0.275, 0.28);
+    shortBox.rotation.y = THREE.MathUtils.degToRad(-18);
+    addBoxWireframe(shortBox);
+    cornell.add(shortBox);
+  }
 
-  const WEBGPU_PROBE_TARGET_TYPE = THREE.UnsignedByteType;
+  bc(simpleScene ? 'simple DDGI test room built' : 'Cornell box built');
+
+  const WEBGPU_PROBE_TARGET_TYPE = THREE.HalfFloatType;
+  const WEBGPU_PROBE_FACE_SIZE = simpleScene ? 16 : 8;
   const WEBGPU_DEPTH_RANGE = 50;
+  const DEFAULT_CHEBYSHEV_ENABLED = simpleScene;
+  const DEFAULT_CHEBYSHEV_FLOOR = simpleScene ? 0.02 : 0.15;
+  const DEFAULT_GI_TRANSPORT_MODE = simpleScene ? 2 : 0;
 
   // ---- SH storage as TSL uniformArray (Phase 4 — DataTexture-free) ----
   // We learned via the diagnostic selector that DataTexture uploads to WebGPU
   // were silently failing — texture(probeSHTex, ...) returned vec3(0). Switching
   // to a flat Vector3 array exposed as TSL uniformArray sidesteps the
-  // 2D-float-texture upload path entirely. 64 probes × 9 vec3 = 576 entries,
+  // 2D-float-texture upload path entirely. 27 probes × 9 vec3 = 243 entries,
   // ~6.75 KB — well within WebGPU's uniform buffer limits.
   const SH_COEFFS = 9;
   const probeSHFlat = [];
@@ -437,11 +504,11 @@ async function createWebGPUScene(canvas) {
   //   4 = SH0      — SH probe[0] only, no trilinear (verifies texture sampling + SH eval math)
   //   5 = SH_TRI   — full trilinear-blended SH GI (production path)
   bc('building TSL GI graph');
-  let uGiMode = null, uGiEnabled = null, uGiIntensity = null, uGiPiFactor = null;
+  let uGiMode = null, uGiEnabled = null, uGiIntensity = null, uGiPiFactor = null, uGiTransportMode = null;
   let uProbeMin = null, uProbeMax = null, uProbeDims = null;
   // Phase 6 — declared in the outer scope so updateOneProbe (defined below the TSL
   // try-block) can use them; assigned inside the try-block where TSL is in scope.
-  let uChebyshevEnabled = null, uDepthBias = null, uDepthProbePos = null;
+  let uChebyshevEnabled = null, uDepthBias = null, uDepthProbePos = null, uChebyshevFloor = null;
   let probeDepthMeanArr = null, probeDepthMeanSqArr = null;
   let depthMat = null;
   try {
@@ -460,6 +527,7 @@ async function createWebGPUScene(canvas) {
     uGiEnabled   = uniform(1.0);
     uGiMode      = uniform(5.0);             // full trilinear by default
     uGiPiFactor  = uniform(1.0);             // /π by default — matches WebGL Lambertian BRDF
+    uGiTransportMode = uniform(DEFAULT_GI_TRANSPORT_MODE);
 
     // SH coefficients exposed as TSL uniformArray of vec3 (length PROBE_COUNT * 9).
     const probeSHArray = uniformArray(probeSHFlat, 'vec3');
@@ -475,8 +543,12 @@ async function createWebGPUScene(canvas) {
     probeDepthMeanSqArr = new Array(PROBE_COUNT).fill(10000.0);
     const uDepthMean        = uniformArray(probeDepthMeanArr,   'float');
     const uDepthMeanSq      = uniformArray(probeDepthMeanSqArr, 'float');
-    uChebyshevEnabled       = uniform(0.0);
+    uChebyshevEnabled       = uniform(DEFAULT_CHEBYSHEV_ENABLED ? 1.0 : 0.0);
     uDepthBias              = uniform(0.05);
+    // Minimum visibility weight for occluded probes. A nonzero floor keeps
+    // probes inside boxes contributing their DC ambient, which prevents the
+    // hard cell seams that show up as bright "blob" patches.
+    uChebyshevFloor         = uniform(DEFAULT_CHEBYSHEV_FLOOR);
 
     // Depth-output material. During the second cube-camera pass per probe, this
     // overrides the scene materials so each fragment writes its world-space
@@ -524,50 +596,101 @@ async function createWebGPUScene(canvas) {
     // trilinear weight (volume of the opposite sub-cube), we compute a
     // visibility weight from the probe's depth statistics — this is what makes
     // probes-inside-boxes get culled instead of contributing wrong radiance.
+    // True trilinear DDGI sampling: each shading point only blends the 8 probes
+    // that are the corners of the grid cell it sits in. The 8 weights are the
+    // standard trilinear weights (volumes of the opposite sub-cube), optionally
+    // multiplied by Chebyshev visibility so that probes the point cannot "see"
+    // (e.g. probes inside boxes) drop out of the blend.
     const giSampleFn = Fn(([wp, n]) => {
+      // Convert world position to grid coordinates [0, Dim-1] along each axis.
       const grid = wp.sub(uProbeMin).div(uProbeMax.sub(uProbeMin))
                    .clamp(vec3(0.0), vec3(1.0))
                    .mul(uProbeDims.sub(vec3(1.0)));
+      // Clamp the base index so base+1 stays inside the grid for points on the
+      // far face. The floor of (clamped grid) is the lower corner of the cell.
+      const baseIdx = grid.min(uProbeDims.sub(vec3(1.0001))).floor();
+      // Trilinear fractions are computed against the *clamped* base, so a point
+      // exactly on the far face uses frac = 1 (full weight to the +1 corner).
+      const fracIdx = grid.sub(baseIdx).clamp(vec3(0.0), vec3(1.0));
+      const probeSpacing = uProbeMax.sub(uProbeMin).div(uProbeDims.sub(vec3(1.0)));
+
+      // Match uploadProbeSHToTex layout: flatIdx = iz*Dx*Dy + iy*Dx + ix.
+      const Dx   = uProbeDims.x;
+      const DxDy = uProbeDims.x.mul(uProbeDims.y);
+
+      // Surface bias — push the shading position slightly along the normal
+      // before evaluating the depth occlusion test. Without this, fragments
+      // sitting on a wall almost always fail Chebyshev (their distance to the
+      // nearest probe roughly equals the probe's mean depth, so distExcess
+      // wobbles around zero and produces blocky cell edges).
+      const wpBiased = wp.add(n.mul(uDepthBias));
+
       let sum  = vec3(0.0).toVar();
       let wSum = float(0.0).toVar();
 
-      // World-space probe spacing — used to recover each probe's world position
-      // from its grid index for the distance term in the Chebyshev test.
-      const probeSpacing = uProbeMax.sub(uProbeMin).div(uProbeDims.sub(vec3(1.0)));
-      const invKernelRadiusSq = float(1.0 / (2.35 * 2.35));
+      for (let cz = 0; cz < 2; cz++) {
+        for (let cy = 0; cy < 2; cy++) {
+          for (let cx = 0; cx < 2; cx++) {
+            const ix = baseIdx.x.add(float(cx));
+            const iy = baseIdx.y.add(float(cy));
+            const iz = baseIdx.z.add(float(cz));
 
-      for (let i = 0; i < PROBE_COUNT; i++) {
-        const ix = i % PROBE_DIMS.x;
-        const iy = Math.floor(i / PROBE_DIMS.x) % PROBE_DIMS.y;
-        const iz = Math.floor(i / (PROBE_DIMS.x * PROBE_DIMS.y));
-        const idx = vec3(float(ix), float(iy), float(iz));
-        const dGrid = grid.sub(idx);
-        const dist2Grid = dGrid.x.mul(dGrid.x).add(dGrid.y.mul(dGrid.y)).add(dGrid.z.mul(dGrid.z));
-        const kernel = float(1.0).sub(dist2Grid.mul(invKernelRadiusSq).clamp(0.0, 1.0));
-        const smoothWeight = kernel.mul(kernel).mul(float(3.0).sub(kernel.mul(2.0)));
-        const pi = float(i);
-        const piInt = int(i);
+            const tx = cx === 0 ? float(1.0).sub(fracIdx.x) : fracIdx.x;
+            const ty = cy === 0 ? float(1.0).sub(fracIdx.y) : fracIdx.y;
+            const tz = cz === 0 ? float(1.0).sub(fracIdx.z) : fracIdx.z;
+            // Smooth the trilinear weight a bit — pure linear weights produce
+            // visible C0 seams between cells in low-res grids; cubic weights
+            // (3t²−2t³) give continuous derivatives across cell boundaries.
+            const sx = tx.mul(tx).mul(float(3.0).sub(tx.mul(2.0)));
+            const sy = ty.mul(ty).mul(float(3.0).sub(ty.mul(2.0)));
+            const sz = tz.mul(tz).mul(float(3.0).sub(tz.mul(2.0)));
+            const triWeight = sx.mul(sy).mul(sz);
 
-        // Phase 6 — Chebyshev visibility test (Majercik et al. 2019).
-        //   chebyshev(t, μ, σ²) = σ² / (σ² + max(0, t − μ − bias)²)
-        // ≈ 1 when the shading point is no further from the probe than the
-        // probe's average occluder distance (probe is "visible" to the point);
-        // → 0 when the point is much further than the probe's occluders
-        // (probe is geometrically occluded). bias prevents over-shadowing right
-        // at the surface. Toggleable via uChebyshevEnabled.
-        const probeWorld  = uProbeMin.add(idx.mul(probeSpacing));
-        const dist        = wp.sub(probeWorld).length();
-        const dMean       = uDepthMean.element(piInt);
-        const dMeanSq     = uDepthMeanSq.element(piInt);
-        const variance    = dMeanSq.sub(dMean.mul(dMean)).max(float(1e-4));
-        const distExcess  = dist.sub(dMean).sub(uDepthBias).max(float(0.0));
-        const chebyshev   = variance.div(variance.add(distExcess.mul(distExcess))).clamp(0.0, 1.0);
-        const visWeight   = float(1.0).mix(chebyshev, uChebyshevEnabled);
+            const flatF = iz.mul(DxDy).add(iy.mul(Dx)).add(ix);
+            const piInt = int(flatF);
+            const pi    = float(flatF);
 
-        const weight = smoothWeight.mul(visWeight);
-        const irr = evalSH(n, pi);  // vec3 (uniformArray-based)
-        sum  = sum.add(irr.mul(weight));
-        wSum = wSum.add(weight);
+            // Chebyshev visibility on the *biased* shading point. Soft falloff
+            // (no min cap on chebyshev) so edges blend instead of stepping.
+            const idxV       = vec3(ix, iy, iz);
+            const probeWorld = uProbeMin.add(idxV.mul(probeSpacing));
+            const dist       = wpBiased.sub(probeWorld).length();
+            const dMean      = uDepthMean.element(piInt);
+            const dMeanSq    = uDepthMeanSq.element(piInt);
+            const variance   = dMeanSq.sub(dMean.mul(dMean)).max(float(1e-4));
+            const distExcess = dist.sub(dMean).max(float(0.0));
+            const chebyshev  = variance.div(variance.add(distExcess.mul(distExcess))).clamp(0.0, 1.0);
+            // Keep a configurable floor so cells with all-occluded probes
+            // still contribute (their DC ambient) rather than turning hard
+            // black. The floor is what stops probe-cell seams from showing
+            // up as bright "blob" patches.
+            const visWeight  = uChebyshevFloor.mix(chebyshev, uChebyshevEnabled).max(uChebyshevFloor);
+
+            const weight = triWeight.mul(visWeight).max(float(1e-5));
+
+            // Hue-preserving SH clamp: the directional reconstruction can dip
+            // below zero on individual channels (band-1/2 basis is signed).
+            // Smoothly fade toward the DC ambient as the worst channel goes
+            // negative, so probes contribute a non-negative, non-hue-shifted
+            // colour.
+            const sampleN = n.mul(vec3(-1.0, 1.0, 1.0));
+            const irrRaw = evalSH(sampleN, pi);
+            const c0Amb  = readSH(pi, 0).mul(0.886227).max(vec3(0.0));
+            const minCh  = irrRaw.x.min(irrRaw.y).min(irrRaw.z);
+            // Ringing fallback uses the *magnitude* of the DC ambient as the
+            // negative-excursion scale. Tiny DC values can no longer drag the
+            // ringing trigger toward zero (was the source of magenta splotches
+            // on dim probes near the colored walls). Floored at 1e-3 so utterly
+            // dark probes still don't divide by zero.
+            const dcMag    = c0Amb.length().max(float(1e-3));
+            const negDepth = minCh.negate().max(float(0.0));
+            const ringing  = negDepth.div(dcMag.mul(float(0.5))).clamp(float(0.0), float(1.0));
+            const irr      = irrRaw.max(vec3(0.0)).mix(c0Amb, ringing);
+
+            sum  = sum.add(irr.mul(weight));
+            wSum = wSum.add(weight);
+          }
+        }
       }
       return sum.div(wSum.max(float(1e-4)));
     });
@@ -580,6 +703,11 @@ async function createWebGPUScene(canvas) {
     const modeMask = (target) => {
       const d = uGiMode.sub(float(target)).abs();
       // 1.0 when |mode - target| < 0.5, else 0.0
+      return float(0.5).sub(d).max(float(0.0)).mul(2.0).clamp(0.0, 1.0);
+    };
+
+    const transportMask = (target) => {
+      const d = uGiTransportMode.sub(float(target)).abs();
       return float(0.5).sub(d).max(float(0.0)).mul(2.0).clamp(0.0, 1.0);
     };
 
@@ -604,24 +732,29 @@ async function createWebGPUScene(canvas) {
       const probeSHRead = probeSHArray.element(int(0));
       const cSh0 = probeSHRead.max(vec3(0.0)).mul(0.5);
 
-      // Phase 5: full GI as an additive light pass. The bounced radiance is fed
-      // through emissiveNode so it lifts the direct-lit material instead of
-      // reading like a colored albedo overlay.
+      // Phase 5: full GI transport. Keep the emissive debug route available, but
+      // allow the simple scene to default to true irradiance injection so the
+      // bounce reads like diffuse light instead of glowing paint.
       const giRaw = giSampleFn(positionWorld, N);
       const giClamped = giRaw.max(vec3(0.0));
       const piFactor = float(1.0).mix(float(1.0/Math.PI), uGiPiFactor);
-      const cFull = giClamped.mul(piFactor).mul(0.55);
+      const cFullDebug = giClamped.mul(piFactor).mul(0.55);
+      const cFullSoft = giClamped.mul(piFactor).mul(0.22);
+      const giIrradiance = giClamped;
+      const fullMask = modeMask(5);
 
       // Sum up phase-gated contributions; only one mask is non-zero at a time.
       const emissive = cConst.mul(modeMask(1))
                   .add( cPos.mul(modeMask(2)) )
                   .add( cNormal.mul(modeMask(3)) )
                   .add( cSh0.mul(modeMask(4)) )
-                  .add( cFull.mul(modeMask(5)) );
+                  .add( cFullDebug.mul(fullMask).mul(transportMask(0)) )
+                  .add( cFullSoft.mul(fullMask).mul(transportMask(1)) );
 
       m.emissiveNode = emissive.mul(uGiEnabled).mul(uGiIntensity);
+      m.ddgiIrradianceNode = giIrradiance.mul(fullMask).mul(transportMask(2)).mul(uGiEnabled).mul(uGiIntensity);
     }
-    bc('emissiveNode wired with 5-phase diagnostic selector');
+    bc('GI transport wired with emissive + irradiance modes');
   } catch (e) {
     bc('TSL graph FAILED: ' + e.message);
     console.error('TSL graph build failed', e);
@@ -642,7 +775,7 @@ async function createWebGPUScene(canvas) {
       THREE.MathUtils.lerp(PROBE_MIN.z, PROBE_MAX.z, z/(PROBE_DIMS.z-1))
     );
     probePositions.push(p);
-    const rt = new THREE.WebGLCubeRenderTarget(16, {
+    const rt = new THREE.WebGLCubeRenderTarget(WEBGPU_PROBE_FACE_SIZE, {
       format: THREE.RGBAFormat, type: WEBGPU_PROBE_TARGET_TYPE,
       generateMipmaps: false, colorSpace: THREE.LinearSRGBColorSpace
     });
@@ -672,7 +805,7 @@ async function createWebGPUScene(canvas) {
   }
 
   // SH integration helpers (pure JS, no TSL involvement)
-  const FACE_SIZE = 16;
+  const FACE_SIZE = WEBGPU_PROBE_FACE_SIZE;
   const COS_BAND = [Math.PI, 2*Math.PI/3, 2*Math.PI/3, 2*Math.PI/3,
                     Math.PI/4, Math.PI/4, Math.PI/4, Math.PI/4, Math.PI/4];
   const FACE_DIRS = [];
@@ -683,12 +816,12 @@ async function createWebGPUScene(canvas) {
       const fv = (v + 0.5) / FACE_SIZE * 2 - 1;
       let xx,yy,zz;
       switch(f) {
-        case 0: xx = 1; yy =-fv; zz =-fu; break;
-        case 1: xx =-1; yy =-fv; zz = fu; break;
-        case 2: xx = fu; yy = 1; zz = fv; break;
-        case 3: xx = fu; yy =-1; zz =-fv; break;
-        case 4: xx = fu; yy =-fv; zz = 1; break;
-        case 5: xx =-fu; yy =-fv; zz =-1; break;
+        case 0: xx =-1; yy =-fv; zz =-fu; break;
+        case 1: xx = 1; yy =-fv; zz = fu; break;
+        case 2: xx =-fu; yy = 1; zz = fv; break;
+        case 3: xx =-fu; yy =-1; zz =-fv; break;
+        case 4: xx =-fu; yy =-fv; zz = 1; break;
+        case 5: xx = fu; yy =-fv; zz =-1; break;
       }
       const len = Math.sqrt(xx*xx+yy*yy+zz*zz);
       arr.push({ x: xx/len, y: yy/len, z: zz/len, w: 4 / ((1 + fu*fu + fv*fv) * len) });
@@ -714,22 +847,115 @@ async function createWebGPUScene(canvas) {
   }
   function shBasis(d) {
     const xx=d.x, yy=d.y, zz=d.z;
-    return [0.282095, -0.488603*yy, 0.488603*zz, -0.488603*xx,
-            1.092548*xx*yy, -1.092548*yy*zz, 0.315392*(3*zz*zz-1),
-            -1.092548*xx*zz, 0.546274*(xx*xx-yy*yy)];
+      return [0.282095, 0.488603*yy, 0.488603*zz, 0.488603*xx,
+        1.092548*xx*yy, 1.092548*yy*zz, 0.315392*(3*zz*zz-1),
+        1.092548*xx*zz, 0.546274*(xx*xx-yy*yy)];
   }
 
+  // ── WebGPU readback workaround ─────────────────────────────────────────────
+  // three.js r172's WebGPUTextureUtils.copyTextureToBuffer allocates a staging
+  // buffer of `width*height*bytesPerTexel`, but copyTextureToBuffer requires
+  // bytesPerRow aligned to 256, so the copy fails with
+  //   "Required size for texture data layout (3904) exceeds the linear data size (1024)".
+  // We drive the WebGPU device directly and copy all 6 cube faces in a single
+  // command encoder + single mapAsync wait, with a pooled per-(format,size)
+  // staging buffer so probe captures stay cheap (no per-call buffer churn).
+  const _readbackPool = new Map();   // key → { bufferAll, paddedRowBytes, tightRowBytes, faceBytes, TypedArray }
+
+  function _formatInfo(format) {
+    switch (format) {
+      case 'rgba8unorm':
+      case 'rgba8unorm-srgb': return { bytesPerTexel: 4,  TypedArray: Uint8Array };
+      case 'rgba16float':     return { bytesPerTexel: 8,  TypedArray: Uint16Array };
+      case 'rgba32float':     return { bytesPerTexel: 16, TypedArray: Float32Array };
+      default: return null;
+    }
+  }
+
+  function _getPool(device, format, width, height) {
+    const key = `${format}|${width}x${height}`;
+    let entry = _readbackPool.get(key);
+    if (entry) return entry;
+    const info = _formatInfo(format);
+    if (!info) return null;
+    const tightRowBytes  = width * info.bytesPerTexel;
+    const paddedRowBytes = Math.ceil(tightRowBytes / 256) * 256;
+    const faceBytes      = paddedRowBytes * height;
+    entry = {
+      paddedRowBytes,
+      tightRowBytes,
+      faceBytes,
+      TypedArray: info.TypedArray,
+      bufferAll: device.createBuffer({
+        size: faceBytes * 6,
+        usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
+      }),
+    };
+    _readbackPool.set(key, entry);
+    return entry;
+  }
+
+  // Reads all 6 faces of the supplied cube RT in one round-trip and returns
+  // an array of 6 tightly-packed typed arrays (no row padding).
+  async function readAllCubeFaces(rt) {
+    const backend = renderer.backend;
+    const device = backend && backend.device;
+    if (!device) return null;
+    const texture = rt.textures[0];
+    const textureData = backend.get(texture);
+    if (!textureData || !textureData.texture) return null;
+    const gpuTexture = textureData.texture;
+    const format = textureData.textureDescriptorGPU.format;
+
+    const width  = FACE_SIZE;
+    const height = FACE_SIZE;
+    const pool = _getPool(device, format, width, height);
+    if (!pool) return null;
+    const { bufferAll, paddedRowBytes, tightRowBytes, faceBytes, TypedArray } = pool;
+
+    const encoder = device.createCommandEncoder();
+    for (let f = 0; f < 6; f++) {
+      encoder.copyTextureToBuffer(
+        { texture: gpuTexture, origin: { x: 0, y: 0, z: f } },
+        { buffer: bufferAll, offset: f * faceBytes, bytesPerRow: paddedRowBytes, rowsPerImage: height },
+        { width, height, depthOrArrayLayers: 1 }
+      );
+    }
+    device.queue.submit([encoder.finish()]);
+
+    await bufferAll.mapAsync(GPUMapMode.READ);
+    const mapped = new Uint8Array(bufferAll.getMappedRange());
+    const result = new Array(6);
+    for (let f = 0; f < 6; f++) {
+      const tight = new Uint8Array(tightRowBytes * height);
+      const base = f * faceBytes;
+      for (let row = 0; row < height; row++) {
+        tight.set(
+          mapped.subarray(base + row * paddedRowBytes, base + row * paddedRowBytes + tightRowBytes),
+          row * tightRowBytes
+        );
+      }
+      result[f] = new TypedArray(tight.buffer);
+    }
+    bufferAll.unmap();
+    return result;
+  }
+
+  // Single-face wrapper retained for callers that still want per-face access.
+  // Internally it always reads the whole cube — fine for our usage since the
+  // only callers do all six faces back-to-back anyway.
   async function readCubeFace(rt, face) {
-    // r172 WebGPURenderer signature: readRenderTargetPixelsAsync(target, x, y, w, h, textureIndex, faceIndex)
-    // textureIndex = 0 (single-target RT), faceIndex = 0..5 for cube faces
-    const data = await renderer.readRenderTargetPixelsAsync(rt, 0, 0, FACE_SIZE, FACE_SIZE, 0, face);
-    return data;
+    const all = await readAllCubeFaces(rt);
+    if (!all) {
+      return renderer.readRenderTargetPixelsAsync(rt, 0, 0, FACE_SIZE, FACE_SIZE, 0, face);
+    }
+    return all[face];
   }
 
   async function integrateSH(rt) {
     const sh = []; for (let k=0; k<9; k++) sh.push({x:0,y:0,z:0});
-    // parallel face readback
-    const allFaces = await Promise.all([0,1,2,3,4,5].map(f => readCubeFace(rt, f)));
+    const allFaces = await readAllCubeFaces(rt) ||
+      await Promise.all([0,1,2,3,4,5].map(f => readCubeFace(rt, f)));
     for (let f=0; f<6; f++) {
       const data = allFaces[f];
       const dirs = FACE_DIRS[f];
@@ -759,6 +985,10 @@ async function createWebGPUScene(canvas) {
     return Math.abs(sh[0].x) + Math.abs(sh[0].y) + Math.abs(sh[0].z);
   }
 
+  // Fallback SH derived analytically from the *current* wall + light colors so
+  // that GUI tweaks visibly affect indirect light even when readback is broken
+  // (WebGPU r172's readRenderTargetPixelsAsync currently mis-sizes the staging
+  // buffer for cube targets — see bc('probe readback returned black; ...').
   function makeFallbackSH(idx) {
     const p = probePositions[idx];
     const x01 = (p.x - PROBE_MIN.x) / (PROBE_MAX.x - PROBE_MIN.x);
@@ -766,18 +996,39 @@ async function createWebGPUScene(canvas) {
     const z01 = (p.z - PROBE_MIN.z) / (PROBE_MAX.z - PROBE_MIN.z);
     const ceiling = Math.max(0, y01);
     const center = 1 - Math.min(1, Math.hypot(x01 - 0.5, z01 - 0.5) * 1.9);
-    const redBleed = Math.pow(Math.max(0, 1 - x01), 1.7);
-    const greenBleed = Math.pow(Math.max(0, x01), 1.7);
+    const redBleed   = Math.pow(Math.max(0, 1 - x01), 1.7); // -X wall (matRed)
+    const greenBleed = Math.pow(Math.max(0, x01), 1.7);     // +X wall (matGreen)
     const sh = []; for (let k=0; k<9; k++) sh.push({x:0,y:0,z:0});
 
-    sh[0].x = 0.12 + 0.24 * ceiling + 0.14 * redBleed + 0.05 * center;
-    sh[0].y = 0.12 + 0.22 * ceiling + 0.13 * greenBleed + 0.05 * center;
-    sh[0].z = 0.11 + 0.18 * ceiling + 0.03 * center;
+    // Sample current scene colors so GUI edits propagate.
+    const red   = matRed.color;
+    const green = matGreen.color;
+    const white = matWhite.color;
+    const panel = uPanelColor.value;       // emissive ceiling panel (HDR)
+    const keyI  = keyLight.intensity;
+    const keyC  = keyLight.color;
+
+    // Direct contribution from the ceiling light + emissive panel — felt most
+    // strongly by probes near the ceiling and toward the room centre.
+    const lit = 0.04 * keyI;
+    const ambR = lit * keyC.r + 0.012 * panel.x;
+    const ambG = lit * keyC.g + 0.012 * panel.y;
+    const ambB = lit * keyC.b + 0.012 * panel.z;
+
+    // Band 0 (DC): white walls + colored side bleed + key/panel ambient.
+    sh[0].x = 0.10 * white.r + 0.22 * white.r * ceiling + 0.20 * red.r   * redBleed   + 0.06 * white.r * center + ambR;
+    sh[0].y = 0.10 * white.g + 0.22 * white.g * ceiling + 0.20 * green.g * greenBleed + 0.06 * white.g * center + ambG;
+    sh[0].z = 0.10 * white.b + 0.18 * white.b * ceiling + 0.04 * white.b * center + ambB;
 
     // Add a little upward/downward variation so the fallback is not perfectly flat.
-    sh[2].x = -0.04 * ceiling;
-    sh[2].y = -0.04 * ceiling;
-    sh[2].z = -0.03 * ceiling;
+    sh[2].x = -0.04 * ceiling * white.r;
+    sh[2].y = -0.04 * ceiling * white.g;
+    sh[2].z = -0.03 * ceiling * white.b;
+
+    // Y-axis colored bleed: red on -X, green on +X (band 3 ~ -x basis).
+    sh[3].x = -0.08 * red.r   * redBleed;
+    sh[3].y = -0.08 * green.g * greenBleed;
+    sh[3].z =  0.0;
     return sh;
   }
 
@@ -787,7 +1038,8 @@ async function createWebGPUScene(canvas) {
   // SH — they encode "how far does this probe see, on average, plus variance".
   async function integrateDepthStats(rt) {
     let sum = 0, sumSq = 0, count = 0;
-    const allFaces = await Promise.all([0,1,2,3,4,5].map(f => readCubeFace(rt, f)));
+    const allFaces = await readAllCubeFaces(rt) ||
+      await Promise.all([0,1,2,3,4,5].map(f => readCubeFace(rt, f)));
     for (let f=0; f<6; f++) {
       const data = allFaces[f];
       for (let i=0; i<FACE_SIZE*FACE_SIZE; i++) {
@@ -804,12 +1056,9 @@ async function createWebGPUScene(canvas) {
     return { mean, meanSq };
   }
 
-  // declare stats early so updateOneProbe (called during priming, before render loop) can use it
+  // declare stats early so probe capture can update the UI during startup bakes
   const stats = new Stats();
-  let nextProbeToUpdate = 0;
-  let probeUpdateInFlight = false;
   let useAnalyticFallback = false;
-  let fallbackPrimed = false;
   let readbackFallbackCount = 0;
   // Materials whose tone mapping must be suppressed during cube-camera probe capture.
   // In WebGPU r172, tone mapping is compiled into NodeMaterial shader graphs, so
@@ -821,28 +1070,51 @@ async function createWebGPUScene(canvas) {
   // with `toneMapped = false` at construction, so we only need the wall mats here.
   const captureMats = [matWhite, matRed, matGreen];
 
-  async function updateOneProbe() {
-    if (probeUpdateInFlight) return;
-    probeUpdateInFlight = true;
+  function setDebugProbeColor(idx, sh) {
+    const sc = 1.0 / 3.5449;
+    const c = sh[0];
+    debugSpheres[idx].material.color.setRGB(
+      finiteClamp(c.x * sc, 0, 1),
+      finiteClamp(c.y * sc, 0, 1),
+      finiteClamp(c.z * sc, 0, 1)
+    );
+  }
+
+  function applyProbeResult(idx, sh, depthStats) {
+    for (let k = 0; k < 9; k++) probesSH[idx][k].set(sh[k].x, sh[k].y, sh[k].z);
+    uploadProbeSHToTex(idx, sh);
+    setDebugProbeColor(idx, sh);
+    if (depthStats) {
+      probeDepthMeanArr[idx] = depthStats.mean;
+      probeDepthMeanSqArr[idx] = depthStats.meanSq;
+    }
+  }
+
+  async function updateOneProbe(idx, options = {}) {
+    const captureDepth = !!options.captureDepth;
+    const cam = cubeCameras[idx];
+    cam.position.copy(probePositions[idx]);
+    const wasDebug = debugProbeGroup.visible;
+    const prevGiEnabled = uGiEnabled ? uGiEnabled.value : null;
+    debugProbeGroup.visible = false;
     try {
-      const idx = nextProbeToUpdate;
-      const cam = cubeCameras[idx];
-      cam.position.copy(probePositions[idx]);
-      const wasDebug = debugProbeGroup.visible;
-      debugProbeGroup.visible = false;
       if (!useAnalyticFallback) {
         const oldTM = renderer.toneMapping;
+        const oldToneMapped = captureMats.map(m => m.toneMapped);
         renderer.toneMapping = THREE.NoToneMapping;
+        try {
       // Phase 5b — bypass tone mapping at the material level (belt-and-braces with
       // the renderer-level toggle above). Without this, the captured radiance is
       // ACES-compressed, which is the root cause of the "subtle GI" symptom.
-        const oldToneMapped = captureMats.map(m => m.toneMapped);
-        for (const m of captureMats) m.toneMapped = false;
-        cam.update(renderer, scene);
-        for (let i = 0; i < captureMats.length; i++) captureMats[i].toneMapped = oldToneMapped[i];
-        renderer.toneMapping = oldTM;
+          if (uGiEnabled) uGiEnabled.value = 0.0;
+          for (const m of captureMats) m.toneMapped = false;
+          cam.update(renderer, scene);
+        } finally {
+          if (uGiEnabled && prevGiEnabled !== null) uGiEnabled.value = prevGiEnabled;
+          for (let i = 0; i < captureMats.length; i++) captureMats[i].toneMapped = oldToneMapped[i];
+          renderer.toneMapping = oldTM;
+        }
       }
-      debugProbeGroup.visible = wasDebug;
 
       try {
         let sh = useAnalyticFallback ? makeFallbackSH(idx) : await integrateSH(probeRadianceRT[idx]);
@@ -854,23 +1126,14 @@ async function createWebGPUScene(canvas) {
             bc('probe readback returned black; using analytic fallback probes');
           }
         }
-        for (let k=0; k<9; k++) probesSH[idx][k].set(sh[k].x, sh[k].y, sh[k].z);
-        uploadProbeSHToTex(idx, sh);
-        // debug sphere color = ambient SH band
-        const sc = 1.0/3.5449;
-        const c = sh[0];
-        debugSpheres[idx].material.color.setRGB(
-          finiteClamp(c.x * sc, 0, 1),
-          finiteClamp(c.y * sc, 0, 1),
-          finiteClamp(c.z * sc, 0, 1)
-        );
+        let depthStats = null;
 
         // Phase 6 — depth pass for Chebyshev visibility. Re-render this probe's
         // cube map with the depth-output material so each fragment writes its
         // distance to the probe instead of radiance, then integrate to mean &
         // mean-squared. This overwrites the radiance in probeRadianceRT[idx],
         // which is fine because we already extracted the SH coefficients above.
-        if (!useAnalyticFallback && depthMat && uDepthProbePos) {
+        if (captureDepth && !useAnalyticFallback && depthMat && uDepthProbePos) {
           uDepthProbePos.value.copy(probePositions[idx]);
           const prevOverride = scene.overrideMaterial;
           const oldTM2 = renderer.toneMapping;
@@ -881,44 +1144,95 @@ async function createWebGPUScene(canvas) {
           renderer.toneMapping = oldTM2;
           try {
             const ds = await integrateDepthStats(probeRadianceRT[idx]);
-            probeDepthMeanArr[idx]   = finiteClamp(ds.mean, 0, 50, 100.0);
-            probeDepthMeanSqArr[idx] = Math.max(
-              probeDepthMeanArr[idx] * probeDepthMeanArr[idx],
-              finiteClamp(ds.meanSq, 0, 2500, 10000.0)
-            );
+            const mean = finiteClamp(ds.mean, 0, 50, 100.0);
+            depthStats = {
+              mean,
+              meanSq: Math.max(mean * mean, finiteClamp(ds.meanSq, 0, 2500, 10000.0))
+            };
           } catch (e) {
             console.warn(`Probe ${idx} depth integration failed:`, e.message);
           }
         }
         stats.totalProbeUpdates++;
+        return { sh, depthStats };
       } catch (e) {
         console.warn(`Probe ${idx} integration failed:`, e.message, e.stack);
         if (idx === 0) bc('integrateSH failed: ' + e.message);
+        return null;
       }
-
-      nextProbeToUpdate = (nextProbeToUpdate + 1) % PROBE_COUNT;
     } finally {
-      probeUpdateInFlight = false;
+      debugProbeGroup.visible = wasDebug;
     }
   }
 
-  // Phase 5c — multi-bounce priming. WebGL's GI accumulates passively because
-  // probe captures see the patched-shader walls already lit by GI from the
-  // previous probe sweep. WebGPU's wall materials use `emissiveNode`, which is
-  // also visible to subsequent probe captures, so the same passive accumulation
-  // works — but only once probes have been swept multiple times. By running 3
-  // sweeps before the first visible frame, we present the user with multi-bounce
-  // GI immediately instead of single-bounce that gradually fills in.
-  const PRIMING_BOUNCES = 3;
-  bc(`priming probes (${PRIMING_BOUNCES} bounces)…`);
-  for (let bounce = 0; bounce < PRIMING_BOUNCES; bounce++) {
-    for (let i = 0; i < PROBE_COUNT; i++) {
-      await updateOneProbe();
-      if ((i & 15) === 0) bc(`bounce ${bounce + 1}/${PRIMING_BOUNCES}: probe ${i}/${PROBE_COUNT}`);
+  // ── Atomic bake ────────────────────────────────────────────────────────────
+  // The runtime path used to update one probe per frame, which exposed the
+  // partially-updated grid: a freshly captured probe blended with stale
+  // neighbours produced visible white/cream "blobs" on the walls. Instead we
+  // do all probes in a single sweep and only publish the new SH after every
+  // probe in that sweep has finished — the visible grid always represents one
+  // consistent lighting solution. Keep startup to a single sweep and run it
+  // after the first frame so the scene becomes interactive immediately.
+  const STARTUP_BOUNCES = 1;
+  const REBAKE_BOUNCES = 1;
+  const REBAKE_DEBOUNCE_MS = 200;
+  let bakeInFlight = false;
+  let bakeRequested = false;
+  let rebakeTimer = 0;
+
+  function shouldBakeDepth() {
+    return !!(uChebyshevEnabled && uChebyshevEnabled.value > 0.5);
+  }
+
+  async function bakeAllProbes(bounces = 1, options = {}) {
+    const captureDepth = options.captureDepth ?? shouldBakeDepth();
+    if (bakeInFlight) { bakeRequested = true; return; }
+    bakeInFlight = true;
+    try {
+      do {
+        bakeRequested = false;
+        for (let bounce = 0; bounce < bounces; bounce++) {
+          // Stage SH for every probe in turn but DO NOT publish to the shader
+          // until the whole sweep is complete.
+          const stagedSH = new Array(PROBE_COUNT);
+          const stagedDepth = new Array(PROBE_COUNT);
+          for (let idx = 0; idx < PROBE_COUNT; idx++) {
+            const result = await updateOneProbe(idx, { captureDepth });
+            if (result) {
+              stagedSH[idx] = result.sh;
+              stagedDepth[idx] = result.depthStats;
+            }
+            bc(`bake ${bounce + 1}/${bounces}: probe ${idx + 1}/${PROBE_COUNT}`);
+          }
+          // Atomic publish — every shader uniform updates within the same JS
+          // task so the next render sees a fully consistent grid.
+          for (let idx = 0; idx < PROBE_COUNT; idx++) {
+            const sh = stagedSH[idx];
+            if (!sh) continue;
+            applyProbeResult(idx, sh, stagedDepth[idx]);
+          }
+        }
+      } while (bakeRequested);
+    } finally {
+      bakeInFlight = false;
     }
   }
-  bc('priming complete');
-  fallbackPrimed = useAnalyticFallback;
+
+  function requestRebake() {
+    if (rebakeTimer) {
+      window.clearTimeout(rebakeTimer);
+      rebakeTimer = 0;
+    }
+    bakeAllProbes(REBAKE_BOUNCES, { captureDepth: shouldBakeDepth() });
+  }
+
+  function scheduleRebake() {
+    if (rebakeTimer) window.clearTimeout(rebakeTimer);
+    rebakeTimer = window.setTimeout(() => {
+      rebakeTimer = 0;
+      bakeAllProbes(REBAKE_BOUNCES, { captureDepth: shouldBakeDepth() });
+    }, REBAKE_DEBOUNCE_MS);
+  }
 
   // ---- GUI ----
   const giModes = {
@@ -929,56 +1243,131 @@ async function createWebGPUScene(canvas) {
     '4 — SH probe[0]':    4,
     '5 — full trilinear': 5,
   };
+  const giTransportModes = {
+    '0 — emissive debug':    0,
+    '1 — soft emissive':     1,
+    '2 — diffuse irradiance': 2,
+  };
   const params = {
     giMode: '5 — full trilinear',
+    giTransport: Object.keys(giTransportModes).find((key) => giTransportModes[key] === DEFAULT_GI_TRANSPORT_MODE),
     exposure: 1.0,
     showProbes: false,
     boxWireframe: false,
     giEnabled: true,
     giIntensity: useAnalyticFallback ? 0.65 : 1.0,
     applyPiFactor: false,              // additive effect: keep the bounce pass visible
-    chebyshevEnabled: false,           // Phase 6 — depth-aware visibility (experimental)
+    chebyshevEnabled: DEFAULT_CHEBYSHEV_ENABLED,
     depthBias: 0.05,                   // Phase 6 — Chebyshev bias
+    chebyshevFloor: DEFAULT_CHEBYSHEV_FLOOR,
+    // light + scene tuning
+    keyIntensity: keyLight.intensity,
+    keyColor: '#' + keyLight.color.getHexString(),
+    keyDecay: keyLight.decay,
+    keyHeight: keyLight.position.y,
+    panelR: uPanelColor.value.x, panelG: uPanelColor.value.y, panelB: uPanelColor.value.z,
+    wallRed:   '#' + matRed.color.getHexString(),
+    wallGreen: '#' + matGreen.color.getHexString(),
+    wallWhite: '#' + matWhite.color.getHexString(),
+    wallRoughness: matWhite.roughness,
+    wallMetalness: matWhite.metalness,
+    rebakeGI: () => requestRebake(),
   };
   const gui = new GUI({ title: 'DDGI · WebGPU (diagnostic)', width: 320 });
-  if (uGiMode) gui.add(params, 'giMode', Object.keys(giModes)).name('GI phase').onChange(v => {
+
+  const fGI = gui.addFolder('GI');
+  if (uGiMode) fGI.add(params, 'giMode', Object.keys(giModes)).name('GI phase').onChange(v => {
     uGiMode.value = giModes[v];
     bc('GI phase → ' + v);
   });
-  if (uGiEnabled)   gui.add(params, 'giEnabled').name('GI enabled').onChange(v => uGiEnabled.value = v ? 1 : 0);
+  if (uGiTransportMode) fGI.add(params, 'giTransport', Object.keys(giTransportModes)).name('GI transport').onChange(v => {
+    uGiTransportMode.value = giTransportModes[v];
+    bc('GI transport → ' + v);
+  });
+  if (uGiEnabled)   fGI.add(params, 'giEnabled').name('GI enabled').onChange(v => uGiEnabled.value = v ? 1 : 0);
   if (uGiIntensity) uGiIntensity.value = params.giIntensity;
   // Phase 5a — slider range matches the WebGL scene (0..3) for direct A/B comparison.
-  if (uGiIntensity) gui.add(params, 'giIntensity', 0, 3, 0.05).name('GI intensity').onChange(v => uGiIntensity.value = v);
+  if (uGiIntensity) fGI.add(params, 'giIntensity', 0, 3, 0.05).name('GI intensity').onChange(v => uGiIntensity.value = v);
   if (uGiPiFactor) {
     uGiPiFactor.value = params.applyPiFactor ? 1 : 0;
-    gui.add(params, 'applyPiFactor').name('Apply 1/π factor').onChange(v => uGiPiFactor.value = v ? 1 : 0);
+    fGI.add(params, 'applyPiFactor').name('Apply 1/π factor').onChange(v => uGiPiFactor.value = v ? 1 : 0);
   }
   // Phase 6 — Chebyshev visibility test toggle + depth bias tuning.
-  if (uChebyshevEnabled) gui.add(params, 'chebyshevEnabled').name('Chebyshev visibility').onChange(v => uChebyshevEnabled.value = v ? 1 : 0);
-  if (uDepthBias)        gui.add(params, 'depthBias', 0, 0.5, 0.005).name('Depth bias').onChange(v => uDepthBias.value = v);
-  gui.add(params, 'showProbes').name('Show probes').onChange(v => debugProbeGroup.visible = v);
-  gui.add(params, 'boxWireframe').name('Box wireframe').onChange(v => boxWireframes.forEach(w => w.visible = v));
-  gui.add(params, 'exposure', 0.2, 2.0, 0.05).name('Exposure').onChange(v => renderer.toneMappingExposure = v);
+  if (uChebyshevEnabled) fGI.add(params, 'chebyshevEnabled').name('Chebyshev visibility').onChange(v => {
+    uChebyshevEnabled.value = v ? 1 : 0;
+    if (v) scheduleRebake();
+  });
+  if (uDepthBias)        fGI.add(params, 'depthBias', 0, 0.5, 0.005).name('Depth bias').onChange(v => uDepthBias.value = v);
+  if (uChebyshevFloor)   fGI.add(params, 'chebyshevFloor', 0, 1, 0.01).name('Cheby floor').onChange(v => uChebyshevFloor.value = v);
+  fGI.add(params, 'rebakeGI').name('Rebake GI');
+
+  const fLight = gui.addFolder('Light');
+  fLight.add(params, 'keyIntensity', 0, 20, 0.05).name('Key intensity').onChange(v => {
+    keyLight.intensity = v;
+    scheduleRebake();
+  });
+  fLight.addColor(params, 'keyColor').name('Key color').onChange(v => {
+    keyLight.color.set(v);
+    scheduleRebake();
+  });
+  fLight.add(params, 'keyDecay', 0, 3, 0.05).name('Key decay').onChange(v => {
+    keyLight.decay = v;
+    scheduleRebake();
+  });
+  fLight.add(params, 'keyHeight', 0.1, 2 * BOX.y - 0.05, 0.01).name('Key height').onChange(v => {
+    keyLight.position.y = v;
+    scheduleRebake();
+  });
+  const setPanel = () => uPanelColor.value.set(params.panelR, params.panelG, params.panelB);
+  const setPanelAndRebake = () => {
+    setPanel();
+    scheduleRebake();
+  };
+  fLight.add(params, 'panelR', 0, 20, 0.05).name('Panel R').onChange(setPanelAndRebake);
+  fLight.add(params, 'panelG', 0, 20, 0.05).name('Panel G').onChange(setPanelAndRebake);
+  fLight.add(params, 'panelB', 0, 20, 0.05).name('Panel B').onChange(setPanelAndRebake);
+
+  const fWalls = gui.addFolder('Walls');
+  fWalls.addColor(params, 'wallRed').name('Red wall').onChange(v => {
+    matRed.color.set(v);
+    scheduleRebake();
+  });
+  fWalls.addColor(params, 'wallGreen').name('Green wall').onChange(v => {
+    matGreen.color.set(v);
+    scheduleRebake();
+  });
+  fWalls.addColor(params, 'wallWhite').name('White walls').onChange(v => {
+    matWhite.color.set(v);
+    scheduleRebake();
+  });
+  fWalls.add(params, 'wallRoughness', 0, 1, 0.01).name('Roughness').onChange(v => {
+    matWhite.roughness = v; matRed.roughness = v; matGreen.roughness = v;
+    scheduleRebake();
+  });
+  fWalls.add(params, 'wallMetalness', 0, 1, 0.01).name('Metalness').onChange(v => {
+    matWhite.metalness = v; matRed.metalness = v; matGreen.metalness = v;
+    scheduleRebake();
+  });
+
+  const fView = gui.addFolder('View');
+  fView.add(params, 'showProbes').name('Show probes').onChange(v => debugProbeGroup.visible = v);
+  fView.add(params, 'boxWireframe').name('Box wireframe').onChange(v => boxWireframes.forEach(w => w.visible = v));
+  fView.add(params, 'exposure', 0.2, 2.0, 0.05).name('Exposure').onChange(v => renderer.toneMappingExposure = v);
   debugProbeGroup.visible = params.showProbes;
+
+  bc(`baking probes (${STARTUP_BOUNCES} bounce${DEFAULT_CHEBYSHEV_ENABLED ? ' + depth' : ''})…`);
+  await bakeAllProbes(STARTUP_BOUNCES, { captureDepth: DEFAULT_CHEBYSHEV_ENABLED });
+  bc('startup bake complete');
 
   // ---- render loop ----
   const clock = new THREE.Clock();
   let rafId;
   let stopped = false;
   let firstFrame = true;
-  let asyncTimer = 0;
   async function tick() {
     if (stopped) return;
     const dt = clock.getDelta();
     controls.update();
-    // Phase 5c — match WebGL's continuous-update cadence so post-priming changes
-    // (movers, lighting tweaks) propagate at similar speed. Single-flight
-    // protection inside updateOneProbe() limits actual concurrency.
-    asyncTimer += dt;
-    if (!fallbackPrimed && asyncTimer > 0.016) {
-      asyncTimer = 0;
-      updateOneProbe(); // fire-and-forget
-    }
     try {
       await renderer.renderAsync(scene, camera);
       if (firstFrame) {
@@ -1011,10 +1400,1451 @@ async function createWebGPUScene(canvas) {
     dispose() {
       stopped = true;
       cancelAnimationFrame(rafId);
+      if (rebakeTimer) window.clearTimeout(rebakeTimer);
       window.removeEventListener('resize', onResize);
       gui.destroy();
       controls.dispose();
       probeRadianceRT.forEach(rt => rt.dispose());
+      for (const entry of _readbackPool.values()) {
+        try { entry.bufferAll.destroy(); } catch (e) { /* already gone */ }
+      }
+      _readbackPool.clear();
+      scene.traverse(o => {
+        if (o.geometry) o.geometry.dispose();
+        if (o.material) {
+          const ms = Array.isArray(o.material) ? o.material : [o.material];
+          ms.forEach(m => m.dispose());
+        }
+      });
+      renderer.dispose();
+    }
+  };
+}
+
+// ============================================================
+// WebGPU raytraced DDGI scene
+//
+// Probe capture is replaced by a WGSL compute shader that traces 64 rays per
+// probe against a three-mesh-bvh BVH, evaluates direct lighting analytically,
+// and reads previous-frame SH probes for indirect bounces. A second compute
+// pass integrates ray hits into per-probe SH coefficients + depth moments.
+//
+// This is the engine path: zero rasterized cubemap captures, arbitrary
+// triangle meshes, and the same Chebyshev-visibility trilinear-SH fragment
+// graph as the existing WebGPU scene (so DDGI sampling math is identical —
+// only the probe-update mechanism differs).
+// ============================================================
+async function createWebGPURTScene(canvas) {
+  if (!navigator.gpu) throw new Error('WebGPU not available in this browser.');
+
+  bc('createWebGPURTScene start');
+
+  bc('loading three/webgpu + three/tsl + three-mesh-bvh…');
+  const [{ WebGPURenderer, MeshStandardNodeMaterial, MeshBasicNodeMaterial, IrradianceNode, TSL }, bvhMod] =
+    await Promise.all([loadWebGPUImports(), import('three-mesh-bvh')]);
+  const { MeshBVH } = bvhMod;
+  bc('imports loaded');
+
+  const renderer = new WebGPURenderer({ canvas, antialias: true });
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+  renderer.setSize(window.innerWidth, window.innerHeight);
+  renderer.outputColorSpace = THREE.SRGBColorSpace;
+  renderer.toneMapping = THREE.ACESFilmicToneMapping;
+  // 1.3 puts more of the scene in the linear part of the ACES curve so 5%
+  // bleed differences become 5% pixel differences (instead of getting
+  // compressed to ~1% near the curve's shoulder at exposure 1.0).
+  renderer.toneMappingExposure = 1.3;
+  await renderer.init();
+  bc('renderer init done');
+
+  const device = renderer.backend && renderer.backend.device;
+  if (!device) throw new Error('WebGPU device unavailable from renderer backend.');
+
+  const scene = new THREE.Scene();
+  scene.background = new THREE.Color(0x000000);
+
+  class DDGIMeshStandardNodeMaterial extends MeshStandardNodeMaterial {
+    constructor(parameters) {
+      super(parameters);
+      this.ddgiIrradianceNode = null;
+    }
+    setupLightMap(builder) {
+      if (this.ddgiIrradianceNode) return new IrradianceNode(this.ddgiIrradianceNode);
+      return super.setupLightMap(builder);
+    }
+    copy(source) { super.copy(source); this.ddgiIrradianceNode = source.ddgiIrradianceNode; return this; }
+  }
+
+  const camera = new THREE.PerspectiveCamera(45, window.innerWidth/window.innerHeight, 0.05, 100);
+  camera.position.set(0, 0.95, 3.0);
+  const controls = new OrbitControls(camera, canvas);
+  controls.target.set(0, 0.65, 0.05);
+  controls.enableDamping = true;
+  controls.minDistance = 1.2;
+  controls.maxDistance = 8;
+
+  // ---- Simplified Cornell room with explicit material ids ----
+  // Material ids are baked into the BVH triangle buffer at build time, so the
+  // ray-tracing shader can look up albedo/emissive without hitting a texture.
+  // This is the model that scales to a real engine: each draw-call material
+  // becomes a slot in a flat Material[] uniform array.
+  const MAT_WHITE = 0;
+  const MAT_RED   = 1;
+  const MAT_GREEN = 2;
+  const MAT_BOX   = 3;
+  const MAT_PANEL = 4; // emissive
+
+  const matWhite = new DDGIMeshStandardNodeMaterial({ color: 0xeeeeee, roughness: 1.0, metalness: 0.0 });
+  const matRed   = new DDGIMeshStandardNodeMaterial({ color: 0xcc2828, roughness: 1.0, metalness: 0.0 });
+  const matGreen = new DDGIMeshStandardNodeMaterial({ color: 0x28a828, roughness: 1.0, metalness: 0.0 });
+  const matBox   = new DDGIMeshStandardNodeMaterial({ color: 0xeeeeee, roughness: 1.0, metalness: 0.0 });
+
+  const cornell = new THREE.Group();
+  scene.add(cornell);
+
+  // Each mesh tags itself with userData.matId so the BVH builder can read it.
+  const tagMat = (mesh, id) => { mesh.userData.matId = id; return mesh; };
+  const makeQuad = (w, h, m, id) => tagMat(new THREE.Mesh(new THREE.PlaneGeometry(w, h), m), id);
+
+  { const m = makeQuad(2*BOX.x, 2*BOX.z, matWhite, MAT_WHITE); m.rotation.x = -Math.PI/2; cornell.add(m); }
+  { const m = makeQuad(2*BOX.x, 2*BOX.z, matWhite, MAT_WHITE); m.rotation.x =  Math.PI/2; m.position.y = 2*BOX.y; cornell.add(m); }
+  { const m = makeQuad(2*BOX.x, 2*BOX.y, matWhite, MAT_WHITE); m.position.set(0, BOX.y, -BOX.z); cornell.add(m); }
+  { const m = makeQuad(2*BOX.z, 2*BOX.y, matRed,   MAT_RED);   m.rotation.y =  Math.PI/2; m.position.set(-BOX.x, BOX.y, 0); cornell.add(m); }
+  { const m = makeQuad(2*BOX.z, 2*BOX.y, matGreen, MAT_GREEN); m.rotation.y = -Math.PI/2; m.position.set( BOX.x, BOX.y, 0); cornell.add(m); }
+
+  // Emissive ceiling panel — its triangles will get matId=MAT_PANEL inside the
+  // BVH and the RT shader treats them as light sources for direct illumination.
+  const lightPanelMat = new MeshBasicNodeMaterial({ color: 0xffffff });
+  const uPanelColor = TSL.uniform(new THREE.Vector3(4.0, 4.0, 3.5));
+  lightPanelMat.colorNode  = uPanelColor;
+  lightPanelMat.toneMapped = false;
+  const lightPanel = tagMat(new THREE.Mesh(new THREE.PlaneGeometry(0.55, 0.45), lightPanelMat), MAT_PANEL);
+  lightPanel.rotation.x = Math.PI/2;
+  lightPanel.position.set(0, 2*BOX.y - 0.001, 0);
+  cornell.add(lightPanel);
+
+  // Direct point light (analytic in the RT shader — see RT_WGSL below).
+  const keyLight = new THREE.PointLight(0xfff8e8, 2.5, 0, 1.0);
+  keyLight.position.set(0, 2*BOX.y - 0.05, 0);
+  scene.add(keyLight);
+  const hemiLight = new THREE.HemisphereLight(0xfff8e8, 0x202028, 0.25);
+  hemiLight.position.set(0, 2*BOX.y, 0);
+  scene.add(hemiLight);
+
+  const centerBox = tagMat(new THREE.Mesh(new THREE.BoxGeometry(0.75, 0.75, 0.75), matBox), MAT_BOX);
+  centerBox.position.set(0, 0.375, 0.1);
+  centerBox.rotation.y = THREE.MathUtils.degToRad(26);
+  cornell.add(centerBox);
+
+  bc('simple RT test room built');
+
+  // ---------- BVH build & serialization ----------
+  // Strategy: bake every mesh's vertex data into world space, concatenate into
+  // a single indexed BufferGeometry, and run MeshBVH on that. This sidesteps a
+  // TLAS for V1 — simpler for a static Cornell test and removes the
+  // CPU-per-frame TLAS rebuild a real engine would need. When you start moving
+  // objects, swap this for a TLAS+BLAS pipeline; the WGSL traverser only
+  // needs to grow an outer-loop and an instance-transform buffer.
+  bc('building merged geometry for BVH');
+  const collectableMeshes = [];
+  cornell.traverse(o => {
+    if (o.isMesh && o.userData.matId !== undefined) collectableMeshes.push(o);
+  });
+
+  // Worst-case triangle count for sizing typed arrays.
+  let totalTriangles = 0;
+  for (const m of collectableMeshes) {
+    let geom = m.geometry;
+    if (geom.index) totalTriangles += geom.index.count / 3;
+    else            totalTriangles += geom.attributes.position.count / 3;
+  }
+  bc(`merging ${collectableMeshes.length} meshes, ${totalTriangles} triangles`);
+
+  const mergedPositions = new Float32Array(totalTriangles * 3 * 3);
+  const mergedNormals   = new Float32Array(totalTriangles * 3 * 3);
+  const mergedMatIds    = new Uint32Array(totalTriangles);
+  let triCursor = 0;
+  const tmpV = new THREE.Vector3();
+  const tmpN = new THREE.Vector3();
+  const normalMat = new THREE.Matrix3();
+
+  for (const m of collectableMeshes) {
+    // toNonIndexed() expands indexed -> flat triangle stream; if already
+    // non-indexed it's a near no-op clone. Using a single path simplifies the
+    // per-vertex loop below.
+    const geom = m.geometry.toNonIndexed();
+    m.updateWorldMatrix(true, false);
+    normalMat.getNormalMatrix(m.matrixWorld);
+    const pos = geom.attributes.position;
+    const nrm = geom.attributes.normal;
+    const triCount = pos.count / 3;
+    for (let t = 0; t < triCount; t++) {
+      for (let v = 0; v < 3; v++) {
+        const srcIdx = t * 3 + v;
+        const dstIdx = (triCursor + t) * 9 + v * 3;
+        tmpV.fromBufferAttribute(pos, srcIdx).applyMatrix4(m.matrixWorld);
+        mergedPositions[dstIdx + 0] = tmpV.x;
+        mergedPositions[dstIdx + 1] = tmpV.y;
+        mergedPositions[dstIdx + 2] = tmpV.z;
+        tmpN.fromBufferAttribute(nrm, srcIdx).applyMatrix3(normalMat).normalize();
+        mergedNormals[dstIdx + 0] = tmpN.x;
+        mergedNormals[dstIdx + 1] = tmpN.y;
+        mergedNormals[dstIdx + 2] = tmpN.z;
+      }
+      mergedMatIds[triCursor + t] = m.userData.matId;
+    }
+    triCursor += triCount;
+  }
+  const TRI_COUNT = triCursor;
+
+  // Build a non-indexed geometry for MeshBVH — it requires an index buffer, so
+  // we add a trivial sequential one. (toNonIndexed strips indices; MeshBVH
+  // refuses non-indexed input.)
+  const bvhGeom = new THREE.BufferGeometry();
+  bvhGeom.setAttribute('position', new THREE.BufferAttribute(mergedPositions, 3));
+  bvhGeom.setAttribute('normal',   new THREE.BufferAttribute(mergedNormals, 3));
+  const seqIndex = new Uint32Array(TRI_COUNT * 3);
+  for (let i = 0; i < seqIndex.length; i++) seqIndex[i] = i;
+  bvhGeom.setIndex(new THREE.BufferAttribute(seqIndex, 1));
+
+  bc(`building BVH (${TRI_COUNT} tris)`);
+  const bvh = new MeshBVH(bvhGeom);
+  const serialized = MeshBVH.serialize(bvh, bvhGeom, { copyIndexBuffer: true });
+  // serialized.roots: ArrayBuffer[] (one per BVH root — single root for our
+  // merged geom). Layout per node (8 u32 words = 32 bytes):
+  //   [0..2] boundsMin (vec3 f32)
+  //   [3..5] boundsMax (vec3 f32)
+  //   [6]    leaf: triIndex offset | internal: right-child u32-offset
+  //   [7]    leaf: count|0xFFFF<<16 | internal: split axis (low 16 bits)
+  // The high 16 bits of word [7] == 0xFFFF flags a leaf.
+  const rootBuffer = serialized.roots[0];
+  const nodeWords  = new Uint32Array(rootBuffer);
+  const nodeFloats = new Float32Array(rootBuffer);
+  const NUM_NODES  = nodeWords.length / 8;
+  // serialized.index: triangle index buffer reordered by BVH. Our triangles
+  // are stored as 3-vertex groups in mergedPositions/Normals, so a leaf's
+  // [offset, offset+count) names *vertex-index triplets* — divide by 3 to get
+  // triangle index for the matId lookup.
+  const idxBuffer = serialized.index;
+  bc(`BVH: ${NUM_NODES} nodes, ${idxBuffer.length} triIdx entries`);
+
+  // ---------- GPU buffers ----------
+  // Layout chosen to stay under the 8-storage-buffer-per-stage limit Chrome
+  // imposes. We use 6 read-only storage buffers + 2 read/write buffers in the
+  // RT pass; 2 read-only + 1 read/write in the integrate pass. Comfortably
+  // within budget.
+  const RAYS_PER_PROBE = 256;
+  const TOTAL_RAYS = PROBE_COUNT * RAYS_PER_PROBE;
+
+  const bvhNodeBuf = device.createBuffer({
+    label: 'bvh-nodes',
+    size: rootBuffer.byteLength,
+    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+  });
+  device.queue.writeBuffer(bvhNodeBuf, 0, rootBuffer);
+
+  const bvhIdxBuf = device.createBuffer({
+    label: 'bvh-triidx',
+    size: idxBuffer.byteLength,
+    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+  });
+  device.queue.writeBuffer(bvhIdxBuf, 0, idxBuffer);
+
+  // Interleaved triangle buffer: pos0, n0, pos1, n1, pos2, n2 (18 floats per
+  // triangle), then the matId in a parallel u32 array. Splitting matId out of
+  // the float interleave means the WGSL side reads a vec3<f32> directly
+  // without bitcasts.
+  const TRI_FLOATS_PER = 18;
+  const triFloatBuf = new Float32Array(TRI_COUNT * TRI_FLOATS_PER);
+  for (let t = 0; t < TRI_COUNT; t++) {
+    const dstBase = t * TRI_FLOATS_PER;
+    const srcBase = t * 9;
+    for (let v = 0; v < 3; v++) {
+      triFloatBuf[dstBase + v*6 + 0] = mergedPositions[srcBase + v*3 + 0];
+      triFloatBuf[dstBase + v*6 + 1] = mergedPositions[srcBase + v*3 + 1];
+      triFloatBuf[dstBase + v*6 + 2] = mergedPositions[srcBase + v*3 + 2];
+      triFloatBuf[dstBase + v*6 + 3] = mergedNormals  [srcBase + v*3 + 0];
+      triFloatBuf[dstBase + v*6 + 4] = mergedNormals  [srcBase + v*3 + 1];
+      triFloatBuf[dstBase + v*6 + 5] = mergedNormals  [srcBase + v*3 + 2];
+    }
+  }
+  const triBuf = device.createBuffer({
+    label: 'tri-data',
+    size: triFloatBuf.byteLength,
+    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+  });
+  device.queue.writeBuffer(triBuf, 0, triFloatBuf);
+  const triMatBuf = device.createBuffer({
+    label: 'tri-matid',
+    size: mergedMatIds.byteLength,
+    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+  });
+  device.queue.writeBuffer(triMatBuf, 0, mergedMatIds);
+
+  // Probe positions — one vec4 per probe (xyz + 1 padding float for std430
+  // alignment).
+  const probePositions = [];
+  const probePosBuf32 = new Float32Array(PROBE_COUNT * 4);
+  for (let z = 0, i = 0; z < PROBE_DIMS.z; z++)
+    for (let y = 0; y < PROBE_DIMS.y; y++)
+      for (let x = 0; x < PROBE_DIMS.x; x++, i++) {
+        const p = new THREE.Vector3(
+          THREE.MathUtils.lerp(PROBE_MIN.x, PROBE_MAX.x, x/(PROBE_DIMS.x-1)),
+          THREE.MathUtils.lerp(PROBE_MIN.y, PROBE_MAX.y, y/(PROBE_DIMS.y-1)),
+          THREE.MathUtils.lerp(PROBE_MIN.z, PROBE_MAX.z, z/(PROBE_DIMS.z-1))
+        );
+        probePositions.push(p);
+        probePosBuf32[i*4 + 0] = p.x;
+        probePosBuf32[i*4 + 1] = p.y;
+        probePosBuf32[i*4 + 2] = p.z;
+        probePosBuf32[i*4 + 3] = 0.0;
+      }
+  const probePosBuf = device.createBuffer({
+    label: 'probe-positions',
+    size: probePosBuf32.byteLength,
+    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+  });
+  device.queue.writeBuffer(probePosBuf, 0, probePosBuf32);
+
+  // Probe debug visualisation — small spheres at each probe location, tinted
+  // by their DC ambient (band-0 SH) after each bake. Hidden by default; the
+  // GUI exposes a "Show probes" toggle.
+  const debugProbeGroup = new THREE.Group();
+  debugProbeGroup.visible = false;
+  scene.add(debugProbeGroup);
+  const debugSpheres = [];
+  for (let i = 0; i < PROBE_COUNT; i++) {
+    const sphere = new THREE.Mesh(
+      new THREE.SphereGeometry(0.04, 12, 8),
+      new MeshBasicNodeMaterial({ color: 0x222222 })
+    );
+    sphere.position.copy(probePositions[i]);
+    debugProbeGroup.add(sphere);
+    debugSpheres.push(sphere);
+  }
+  // Per-probe "trapped" flag (true = >10% rays hit backfaces, probe is
+  // inside or grazing geometry). Filled by the integrate readback in bakeOnce.
+  const probeTrappedFlags = new Array(PROBE_COUNT).fill(false);
+  // Float (0/1) mirror of probeTrappedFlags shared with the TSL graph so the
+  // fragment-shader trilinear loop can downweight a trapped probe's contribution.
+  // Forward-declared so the TSL builder (run later) sees the same array.
+  let probeTrappedFloatArr = null;
+  function updateDebugProbeColors() {
+    // Convert each probe's band-0 SH (the DC ambient) to a sphere tint.
+    // Trapped probes (inside geometry) are marked with a magenta tint so
+    // they're visually obvious during debugging — their SH was reseeded
+    // from neighbours so the color won't be black even though they would
+    // have captured zero radiance themselves.
+    const sc = 1.0 / 3.5449;
+    for (let i = 0; i < PROBE_COUNT; i++) {
+      if (probeTrappedFlags[i]) {
+        debugSpheres[i].material.color.setRGB(1.0, 0.0, 0.6);
+      } else {
+        const c = probeSHFlat[i * 9];
+        debugSpheres[i].material.color.setRGB(
+          Math.max(0, Math.min(1, c.x * sc)),
+          Math.max(0, Math.min(1, c.y * sc)),
+          Math.max(0, Math.min(1, c.z * sc))
+        );
+      }
+    }
+  }
+
+  // Output: per-ray (radiance.rgb, hitDistance) packed as vec4<f32>. The
+  // integrate pass consumes this and produces SH coefficients + depth moments.
+  const rayHitsBuf = device.createBuffer({
+    label: 'ray-hits',
+    size: TOTAL_RAYS * 16,
+    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
+  });
+  // Debug: stage one probe's worth of rays back to CPU so we can visualize
+  // the radiance each direction captured.
+  const DEBUG_PROBE_IDX = (PROBE_DIMS.z - 1) * (PROBE_DIMS.x * PROBE_DIMS.y)
+                        + (PROBE_DIMS.y - 1) * PROBE_DIMS.x
+                        + (PROBE_DIMS.x - 1); // top-right-front
+  const debugRayReadBuf = device.createBuffer({
+    label: 'debug-ray-readback',
+    size: RAYS_PER_PROBE * 16,
+    usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
+  });
+
+  // Per-probe SH (9 vec3 = 9 vec4 with padding = 144 bytes/probe) + depth
+  // moments (vec2 -> 8 bytes/probe, padded to 16 for alignment).
+  const SH_VEC4_PER_PROBE = 9;
+  const probeSHBufBytes = PROBE_COUNT * SH_VEC4_PER_PROBE * 16;
+  const probeSHBuf = device.createBuffer({
+    label: 'probe-sh',
+    size: probeSHBufBytes,
+    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
+  });
+  // Initialise to zero (default after createBuffer is undefined; explicit zero
+  // fill so the first ray-tracing pass that reads the SH cache for indirect
+  // bounce sees zero, not garbage).
+  device.queue.writeBuffer(probeSHBuf, 0, new Float32Array(probeSHBufBytes / 4));
+
+  const probeDepthBuf = device.createBuffer({
+    label: 'probe-depth-moments',
+    size: PROBE_COUNT * 16, // vec4: mean, meanSq, _, _
+    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
+  });
+
+  // Staging buffers for readback (created lazily once, reused every bake).
+  const probeSHReadBuf = device.createBuffer({
+    label: 'probe-sh-readback',
+    size: probeSHBufBytes,
+    usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
+  });
+  const probeDepthReadBuf = device.createBuffer({
+    label: 'probe-depth-readback',
+    size: PROBE_COUNT * 16,
+    usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
+  });
+
+  // Uniforms: scene-wide RT params (light, panel, materials, frame state).
+  // Layout (vec4-aligned):
+  //   keyPos.xyz, keyIntensity                   (vec4)
+  //   keyColor.rgb, _pad                         (vec4)
+  //   panelEmission.rgb, _pad                    (vec4)
+  //   probeMin.xyz, _pad                         (vec4)
+  //   probeMax.xyz, _pad                         (vec4)
+  //   probeDims.xyz, raysPerProbe (as float)     (vec4)
+  //   numNodes, numTris, frameSeed, indirectScale (vec4 / mixed)
+  //   materials[8]: vec4 albedo, vec4 emissive   (16 floats per slot)
+  const NUM_MATERIAL_SLOTS = 8;
+  const RT_UNIFORM_VEC4S = 7 + NUM_MATERIAL_SLOTS * 2;
+  const rtUniBuf32 = new Float32Array(RT_UNIFORM_VEC4S * 4);
+  const rtUniBuf = device.createBuffer({
+    label: 'rt-uniforms',
+    size: rtUniBuf32.byteLength,
+    usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+  });
+  function packRTUniforms(frameSeed, indirectScale) {
+    const u = rtUniBuf32;
+    u[0]  = keyLight.position.x; u[1]  = keyLight.position.y; u[2]  = keyLight.position.z;
+    u[3]  = keyLight.intensity;
+    u[4]  = keyLight.color.r;    u[5]  = keyLight.color.g;    u[6]  = keyLight.color.b; u[7] = 0;
+    u[8]  = uPanelColor.value.x; u[9]  = uPanelColor.value.y; u[10] = uPanelColor.value.z; u[11] = 0;
+    u[12] = PROBE_MIN.x; u[13] = PROBE_MIN.y; u[14] = PROBE_MIN.z; u[15] = 0;
+    u[16] = PROBE_MAX.x; u[17] = PROBE_MAX.y; u[18] = PROBE_MAX.z; u[19] = 0;
+    u[20] = PROBE_DIMS.x; u[21] = PROBE_DIMS.y; u[22] = PROBE_DIMS.z; u[23] = RAYS_PER_PROBE;
+    u[24] = NUM_NODES; u[25] = TRI_COUNT; u[26] = frameSeed; u[27] = indirectScale;
+    // materials — WGSL struct has two separate arrays:
+    //   matAlbedo[8]   at floats 28..59  (8 vec4 = 32 floats)
+    //   matEmissive[8] at floats 60..91
+    // Earlier code wrote them interleaved as if it were array-of-struct, which
+    // mis-aligned every material slot past 0 and made the green wall read the
+    // red albedo slot. Write into the matching struct-of-arrays layout now.
+    const writeMat = (slot, r, g, b, er, eg, eb) => {
+      const albOff = 28 + slot * 4;
+      const emOff  = 60 + slot * 4;
+      u[albOff+0]=r;  u[albOff+1]=g;  u[albOff+2]=b;  u[albOff+3]=0;
+      u[emOff+0]=er;  u[emOff+1]=eg;  u[emOff+2]=eb;  u[emOff+3]=0;
+    };
+    writeMat(MAT_WHITE, matWhite.color.r, matWhite.color.g, matWhite.color.b, 0,0,0);
+    writeMat(MAT_RED,   matRed.color.r,   matRed.color.g,   matRed.color.b,   0,0,0);
+    writeMat(MAT_GREEN, matGreen.color.r, matGreen.color.g, matGreen.color.b, 0,0,0);
+    writeMat(MAT_BOX,   matBox.color.r,   matBox.color.g,   matBox.color.b,   0,0,0);
+    writeMat(MAT_PANEL, 0, 0, 0, uPanelColor.value.x, uPanelColor.value.y, uPanelColor.value.z);
+    device.queue.writeBuffer(rtUniBuf, 0, u);
+  }
+
+  // ---------- WGSL shaders ----------
+  const RT_WGSL = /* wgsl */`
+struct RTUniforms {
+  keyPosI:    vec4<f32>,    // xyz=pos, w=intensity
+  keyColor:   vec4<f32>,    // rgb=color, w=_
+  panelEmit:  vec4<f32>,    // rgb=emission, w=_
+  probeMin:   vec4<f32>,
+  probeMax:   vec4<f32>,
+  probeDimsR: vec4<f32>,    // xyz=dims, w=raysPerProbe
+  rtMeta:     vec4<f32>,    // x=numNodes, y=numTris, z=frameSeed, w=indirectScale
+  matAlbedo:  array<vec4<f32>, 8>,
+  matEmissive:array<vec4<f32>, 8>,
+};
+@group(0) @binding(0) var<uniform> U: RTUniforms;
+@group(0) @binding(1) var<storage, read> bvhNodes: array<u32>;       // 8 u32 per node
+@group(0) @binding(2) var<storage, read> bvhTriIdx: array<u32>;
+@group(0) @binding(3) var<storage, read> triData:   array<f32>;      // 18 f32 per tri
+@group(0) @binding(4) var<storage, read> triMatId:  array<u32>;
+@group(0) @binding(5) var<storage, read> probePos:  array<vec4<f32>>;
+@group(0) @binding(6) var<storage, read> probeSHIn: array<vec4<f32>>;// 9 vec4 per probe
+@group(0) @binding(7) var<storage, read_write> rayHits: array<vec4<f32>>;
+
+const PI : f32 = 3.14159265358979;
+
+fn nodeBoundsMin(nodeI: u32) -> vec3<f32> {
+  let b = nodeI * 8u;
+  return vec3<f32>(bitcast<f32>(bvhNodes[b]), bitcast<f32>(bvhNodes[b+1u]), bitcast<f32>(bvhNodes[b+2u]));
+}
+fn nodeBoundsMax(nodeI: u32) -> vec3<f32> {
+  let b = nodeI * 8u;
+  return vec3<f32>(bitcast<f32>(bvhNodes[b+3u]), bitcast<f32>(bvhNodes[b+4u]), bitcast<f32>(bvhNodes[b+5u]));
+}
+fn nodeIsLeaf(nodeI: u32) -> bool {
+  let b = nodeI * 8u;
+  // word [7]: leaf flag in high 16 bits == 0xFFFF
+  return ((bvhNodes[b+7u] >> 16u) & 0xFFFFu) == 0xFFFFu;
+}
+fn nodeOffset(nodeI: u32) -> u32 { return bvhNodes[nodeI * 8u + 6u]; }
+fn nodeCount(nodeI: u32)  -> u32 { return bvhNodes[nodeI * 8u + 7u] & 0xFFFFu; }
+fn nodeRight(nodeI: u32)  -> u32 { return bvhNodes[nodeI * 8u + 6u] / 8u; } // u32 offset / words-per-node = node index
+
+// Branchless ray-AABB slab test. Returns true and tNear/tFar on hit.
+fn rayAabb(ro: vec3<f32>, invRd: vec3<f32>, bMin: vec3<f32>, bMax: vec3<f32>, tMaxIn: f32) -> vec2<f32> {
+  let t1 = (bMin - ro) * invRd;
+  let t2 = (bMax - ro) * invRd;
+  let tMin = min(t1, t2);
+  let tMax = max(t1, t2);
+  let tNear = max(max(tMin.x, tMin.y), tMin.z);
+  let tFar  = min(min(tMax.x, tMax.y), min(tMax.z, tMaxIn));
+  return vec2<f32>(tNear, tFar);
+}
+
+struct TriHit { t: f32, u: f32, v: f32 };
+
+fn rayTri(ro: vec3<f32>, rd: vec3<f32>, v0: vec3<f32>, v1: vec3<f32>, v2: vec3<f32>) -> TriHit {
+  // Möller–Trumbore. Returns t = -1 on miss.
+  let e1 = v1 - v0;
+  let e2 = v2 - v0;
+  let pv = cross(rd, e2);
+  let det = dot(e1, pv);
+  var hit: TriHit;
+  hit.t = -1.0; hit.u = 0.0; hit.v = 0.0;
+  if (abs(det) < 1e-8) { return hit; }
+  let invDet = 1.0 / det;
+  let tv = ro - v0;
+  let u = dot(tv, pv) * invDet;
+  if (u < 0.0 || u > 1.0) { return hit; }
+  let qv = cross(tv, e1);
+  let v = dot(rd, qv) * invDet;
+  if (v < 0.0 || u + v > 1.0) { return hit; }
+  let t = dot(e2, qv) * invDet;
+  if (t < 1e-4) { return hit; }
+  hit.t = t; hit.u = u; hit.v = v;
+  return hit;
+}
+
+struct SceneHit {
+  hit: bool,
+  t: f32,
+  pos: vec3<f32>,
+  nrm: vec3<f32>,
+  matId: u32,
+};
+
+fn traceScene(roIn: vec3<f32>, rd: vec3<f32>, tMaxIn: f32) -> SceneHit {
+  var result: SceneHit;
+  result.hit = false; result.t = tMaxIn;
+  result.pos = vec3<f32>(0.0); result.nrm = vec3<f32>(0.0); result.matId = 0u;
+
+  // Guard against zero components on axis-aligned rays — slab test handles
+  // resulting +inf cleanly, but we'd rather not feed NaN into min/max.
+  let safeRdX = select(rd.x, 1e-20, abs(rd.x) < 1e-20);
+  let safeRdY = select(rd.y, 1e-20, abs(rd.y) < 1e-20);
+  let safeRdZ = select(rd.z, 1e-20, abs(rd.z) < 1e-20);
+  let invRd = vec3<f32>(1.0 / safeRdX, 1.0 / safeRdY, 1.0 / safeRdZ);
+  // Stack of node indices to visit. Depth ~24 covers a 16-leaf BVH; we cap at
+  // 32 to match WGSL function-local-bytes budgets on mobile drivers.
+  var stack: array<u32, 32>;
+  var sp: i32 = 0;
+  stack[0] = 0u;
+  sp = 1;
+
+  loop {
+    if (sp == 0) { break; }
+    sp = sp - 1;
+    let nodeI = stack[sp];
+
+    let aabb = rayAabb(roIn, invRd, nodeBoundsMin(nodeI), nodeBoundsMax(nodeI), result.t);
+    if (aabb.x > aabb.y || aabb.x > result.t) { continue; }
+
+    if (nodeIsLeaf(nodeI)) {
+      let off = nodeOffset(nodeI);   // offset in *triangles*
+      let cnt = nodeCount(nodeI);    // count in *triangles*
+      let vertOff = off * 3u;        // multiplied to index into bvhTriIdx
+      for (var i: u32 = 0u; i < cnt; i = i + 1u) {
+        // Each triangle = 3 consecutive vertex indices in bvhTriIdx; since the
+        // source geometry was non-indexed (sequential vert ids), all 3 indices
+        // for a tri map to the same triangle slot in our packed triData. We
+        // read just the first.
+        let triId = bvhTriIdx[vertOff + i * 3u] / 3u;
+        let base = triId * 18u;
+        let v0 = vec3<f32>(triData[base+0u],  triData[base+1u],  triData[base+2u]);
+        let v1 = vec3<f32>(triData[base+6u],  triData[base+7u],  triData[base+8u]);
+        let v2 = vec3<f32>(triData[base+12u], triData[base+13u], triData[base+14u]);
+        let h = rayTri(roIn, rd, v0, v1, v2);
+        if (h.t > 0.0 && h.t < result.t) {
+          result.hit = true;
+          result.t = h.t;
+          result.pos = roIn + rd * h.t;
+          let n0 = vec3<f32>(triData[base+3u],  triData[base+4u],  triData[base+5u]);
+          let n1 = vec3<f32>(triData[base+9u],  triData[base+10u], triData[base+11u]);
+          let n2 = vec3<f32>(triData[base+15u], triData[base+16u], triData[base+17u]);
+          let w = 1.0 - h.u - h.v;
+          result.nrm = normalize(n0 * w + n1 * h.u + n2 * h.v);
+          result.matId = triMatId[triId];
+        }
+      }
+    } else {
+      // Push both children. Order doesn't matter for a closest-hit query but
+      // pushing the further one first means we pop the nearer one first — a
+      // small but real perf win on imbalanced trees. Skip the heuristic for V1.
+      if (sp < 30) {
+        stack[sp] = nodeI + 1u;        // left = next node in buffer
+        sp = sp + 1;
+        stack[sp] = nodeRight(nodeI);
+        sp = sp + 1;
+      }
+    }
+  }
+  return result;
+}
+
+// Visibility test for direct lighting. Same traversal but stops on first hit.
+fn occluded(ro: vec3<f32>, rd: vec3<f32>, tMax: f32) -> bool {
+  // Guard against zero components on axis-aligned rays — slab test handles
+  // resulting +inf cleanly, but we'd rather not feed NaN into min/max.
+  let safeRdX = select(rd.x, 1e-20, abs(rd.x) < 1e-20);
+  let safeRdY = select(rd.y, 1e-20, abs(rd.y) < 1e-20);
+  let safeRdZ = select(rd.z, 1e-20, abs(rd.z) < 1e-20);
+  let invRd = vec3<f32>(1.0 / safeRdX, 1.0 / safeRdY, 1.0 / safeRdZ);
+  var stack: array<u32, 32>;
+  var sp: i32 = 0;
+  stack[0] = 0u;
+  sp = 1;
+  loop {
+    if (sp == 0) { break; }
+    sp = sp - 1;
+    let nodeI = stack[sp];
+    let aabb = rayAabb(ro, invRd, nodeBoundsMin(nodeI), nodeBoundsMax(nodeI), tMax);
+    if (aabb.x > aabb.y) { continue; }
+    if (nodeIsLeaf(nodeI)) {
+      let off = nodeOffset(nodeI);
+      let cnt = nodeCount(nodeI);
+      let vertOff = off * 3u;
+      for (var i: u32 = 0u; i < cnt; i = i + 1u) {
+        let triId = bvhTriIdx[vertOff + i * 3u] / 3u;
+        let base = triId * 18u;
+        let v0 = vec3<f32>(triData[base+0u],  triData[base+1u],  triData[base+2u]);
+        let v1 = vec3<f32>(triData[base+6u],  triData[base+7u],  triData[base+8u]);
+        let v2 = vec3<f32>(triData[base+12u], triData[base+13u], triData[base+14u]);
+        let h = rayTri(ro, rd, v0, v1, v2);
+        if (h.t > 0.0 && h.t < tMax) { return true; }
+      }
+    } else {
+      if (sp < 30) {
+        stack[sp] = nodeI + 1u; sp = sp + 1;
+        stack[sp] = nodeRight(nodeI); sp = sp + 1;
+      }
+    }
+  }
+  return false;
+}
+
+// Sample previous-frame SH at a world-space point — this is what gives DDGI
+// its infinite-bounce property. Trilinear over the 8 nearest probes, no
+// Chebyshev (the fragment shader does that for the camera's POV; here we just
+// want a smooth radiance cache for indirect bounces).
+fn evalSH(n: vec3<f32>, probeIdx: u32) -> vec3<f32> {
+  let base = probeIdx * 9u;
+  let c0 = probeSHIn[base+0u].xyz;
+  let c1 = probeSHIn[base+1u].xyz;
+  let c2 = probeSHIn[base+2u].xyz;
+  let c3 = probeSHIn[base+3u].xyz;
+  let c4 = probeSHIn[base+4u].xyz;
+  let c5 = probeSHIn[base+5u].xyz;
+  let c6 = probeSHIn[base+6u].xyz;
+  let c7 = probeSHIn[base+7u].xyz;
+  let c8 = probeSHIn[base+8u].xyz;
+  let x = n.x; let y = n.y; let z = n.z;
+  return c0 * 0.886227
+       + c1 * (2.0 * 0.511664 * y)
+       + c2 * (2.0 * 0.511664 * z)
+       + c3 * (2.0 * 0.511664 * x)
+       + c4 * (2.0 * 0.429043 * x*y)
+       + c5 * (2.0 * 0.429043 * y*z)
+       + c6 * (z*z*0.743125 - 0.247708)
+       + c7 * (2.0 * 0.429043 * x*z)
+       + c8 * (0.429043 * (x*x - y*y));
+}
+
+fn sampleProbeGridSH(p: vec3<f32>, n: vec3<f32>) -> vec3<f32> {
+  let dims = U.probeDimsR.xyz;
+  let pmin = U.probeMin.xyz;
+  let pmax = U.probeMax.xyz;
+  let grid = clamp((p - pmin) / (pmax - pmin), vec3<f32>(0.0), vec3<f32>(1.0)) * (dims - vec3<f32>(1.0));
+  let baseI = floor(min(grid, dims - vec3<f32>(1.0001)));
+  let frac = clamp(grid - baseI, vec3<f32>(0.0), vec3<f32>(1.0));
+  let Dx = u32(dims.x);
+  let Dy = u32(dims.y);
+  var sum = vec3<f32>(0.0);
+  var wSum = 0.0;
+  for (var cz: i32 = 0; cz < 2; cz = cz + 1) {
+    for (var cy: i32 = 0; cy < 2; cy = cy + 1) {
+      for (var cx: i32 = 0; cx < 2; cx = cx + 1) {
+        let ix = u32(baseI.x) + u32(cx);
+        let iy = u32(baseI.y) + u32(cy);
+        let iz = u32(baseI.z) + u32(cz);
+        let tx = select(1.0 - frac.x, frac.x, cx == 1);
+        let ty = select(1.0 - frac.y, frac.y, cy == 1);
+        let tz = select(1.0 - frac.z, frac.z, cz == 1);
+        let w = max(tx * ty * tz, 1e-5);
+        let idx = iz * Dx * Dy + iy * Dx + ix;
+        sum = sum + max(evalSH(n, idx), vec3<f32>(0.0)) * w;
+        wSum = wSum + w;
+      }
+    }
+  }
+  return sum / max(wSum, 1e-4);
+}
+
+// Cheap deterministic hash → uniform float — used for per-ray jitter.
+fn hash11(x: u32) -> f32 {
+  var n = x ^ (x >> 16u);
+  n = n * 0x21f0aaadu;
+  n = n ^ (n >> 15u);
+  n = n * 0x735a2d97u;
+  n = n ^ (n >> 15u);
+  return f32(n) / f32(0xffffffffu);
+}
+
+// Fibonacci sphere direction, jittered by frame seed for temporal coverage.
+fn fibSphere(rayI: u32, total: u32, seed: f32) -> vec3<f32> {
+  let golden = 0.5 * (sqrt(5.0) - 1.0);
+  let i = f32(rayI) + 0.5 + seed;
+  let phi = 2.0 * PI * fract(i * golden);
+  let cosTheta = 1.0 - 2.0 * (i / f32(total));
+  let sinTheta = sqrt(max(0.0, 1.0 - cosTheta * cosTheta));
+  return vec3<f32>(cos(phi) * sinTheta, sin(phi) * sinTheta, cosTheta);
+}
+
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let rayId = gid.x;
+  let totalRays = u32(U.probeDimsR.w) * u32(U.probeDimsR.x * U.probeDimsR.y * U.probeDimsR.z);
+  if (rayId >= totalRays) { return; }
+  let raysPer = u32(U.probeDimsR.w);
+  let probeIdx = rayId / raysPer;
+  let inProbe  = rayId - probeIdx * raysPer;
+
+  let ro = probePos[probeIdx].xyz;
+  let rd = fibSphere(inProbe, raysPer, U.rtMeta.z + f32(probeIdx) * 0.61803);
+
+  let h = traceScene(ro, rd, 50.0);
+  var radiance = vec3<f32>(0.0);
+  var hitDist = 50.0;
+  // Backface flag: a ray hitting the *inside* of a triangle (dot(rd, n) > 0)
+  // means this part of the probe's hemisphere is buried in geometry. We
+  // encode the flag in the sign of hitDist so the integrate pass can count
+  // backfaces without an extra storage buffer (saves a binding slot).
+  var backface = false;
+  if (h.hit) {
+    hitDist = h.t;
+    backface = dot(rd, h.nrm) > 0.0;
+    let albedo = U.matAlbedo[h.matId].xyz;
+    // Tonemap the emissive before it enters SH projection. The light panel
+    // emits at HDR levels (~8.0) but SH band-1/2 cannot represent a single
+    // bright direction without producing visible negative-lobe rings on
+    // surfaces near the source. Aggressive Reinhard (k=0.8) maps a panel
+    // emission of 8 down to ~1.2, which is well within band-2's faithful
+    // representation range while still letting the panel dominate the DC
+    // ambient of nearby probes (which is what drives bounce intensity).
+    // The fragment shader still receives the full HDR panel emission via
+    // the lightPanel mesh, so the *visible* panel is unaffected.
+    let emissive = U.matEmissive[h.matId].xyz;
+    let compressedE = emissive / (vec3<f32>(1.0) + emissive * 0.8);
+    radiance = compressedE;
+
+    // Direct lighting: point light (analytic, with shadow-ray test).
+    let toLight = U.keyPosI.xyz - h.pos;
+    let lDist = length(toLight);
+    let lDir = toLight / max(lDist, 1e-6);
+    let nDotL = max(dot(h.nrm, lDir), 0.0);
+    if (nDotL > 0.0) {
+      // Bias the shadow origin along the surface normal to avoid self-hit.
+      let shadowOrigin = h.pos + h.nrm * 1e-3;
+      if (!occluded(shadowOrigin, lDir, lDist - 1e-3)) {
+        // Inverse-square attenuation matches three.js PointLight with decay=1
+        // (one-over-distance-squared in linear space).
+        let atten = 1.0 / max(lDist * lDist, 1e-4);
+        radiance = radiance + albedo * (U.keyColor.xyz * U.keyPosI.w * nDotL * atten / PI);
+      }
+    }
+
+    // Indirect: sample the probe-grid SH at the hit point. Clip negatives
+    // (SH ringing artifact, not real radiance) but allow positive bounces to
+    // accumulate — capping here would prevent multi-bounce from reaching
+    // steady-state where colored walls saturate enough to bleed visibly.
+    // The per-ray total radiance clamp below (line ~2160) is the safety net.
+    let indirect = max(sampleProbeGridSH(h.pos, h.nrm), vec3<f32>(0.0));
+    radiance = radiance + albedo * indirect * U.rtMeta.w / PI;
+  }
+  // Final per-ray clamp — generous now that the SH math is correctly
+  // normalized (no double-cosBand). The panel hits compress to ~1.6 via
+  // emissive Reinhard above, walls reflect ~0.05–0.5, so 3.0 leaves
+  // headroom while still bounding pathological spikes.
+  radiance = min(radiance, vec3<f32>(3.0));
+  // Encode backface as negative distance. Integrate pass: dist < 0 means
+  // backface, abs(dist) is the actual hit distance.
+  let signedDist = select(hitDist, -hitDist, backface);
+  rayHits[rayId] = vec4<f32>(radiance, signedDist);
+}
+`;
+
+  const INTEGRATE_WGSL = /* wgsl */`
+struct IntUniforms {
+  raysPerProbe: u32,
+  numProbes: u32,
+  depthRange: f32,
+  frameSeed: f32, // must match RT pass — directions are seed-deterministic
+};
+@group(0) @binding(0) var<uniform> U: IntUniforms;
+@group(0) @binding(1) var<storage, read> rayHits: array<vec4<f32>>;
+@group(0) @binding(2) var<storage, read_write> probeSH: array<vec4<f32>>;     // 9 vec4/probe
+@group(0) @binding(3) var<storage, read_write> probeDepth: array<vec4<f32>>;  // mean,meanSq,_,_
+
+const PI: f32 = 3.14159265358979;
+
+// We project raw radiance L_l^m and let the fragment shader apply the
+// cosine-convolution normalization via its precomputed combined constants
+// (e.g. 2*0.511664 already encodes 2π/3 * basis). Pre-applying cosBand here
+// would double-count the convolution and produce mis-coloured reconstruction.
+
+fn fibSphere(rayI: u32, total: u32, seed: f32) -> vec3<f32> {
+  let golden = 0.5 * (sqrt(5.0) - 1.0);
+  let i = f32(rayI) + 0.5 + seed;
+  let phi = 2.0 * PI * fract(i * golden);
+  let cosTheta = 1.0 - 2.0 * (i / f32(total));
+  let sinTheta = sqrt(max(0.0, 1.0 - cosTheta * cosTheta));
+  return vec3<f32>(cos(phi) * sinTheta, sin(phi) * sinTheta, cosTheta);
+}
+
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let probeIdx = gid.x;
+  if (probeIdx >= U.numProbes) { return; }
+  let raysPer = U.raysPerProbe;
+  let weight = 4.0 * PI / f32(raysPer); // uniform sphere measure
+
+  var sh: array<vec3<f32>, 9>;
+  for (var k: u32 = 0u; k < 9u; k = k + 1u) { sh[k] = vec3<f32>(0.0); }
+  var depthSum = 0.0;
+  var depthSumSq = 0.0;
+  var backfaceCount: u32 = 0u;
+
+  for (var i: u32 = 0u; i < raysPer; i = i + 1u) {
+    let rayId = probeIdx * raysPer + i;
+    let hit = rayHits[rayId];
+    let radiance = hit.xyz;
+    // hit.w < 0 means the ray hit the inside of a triangle (backface) — the
+    // RT pass encoded this as a sign on the distance to save a binding slot.
+    let signedDist = hit.w;
+    let isBackface = signedDist < 0.0;
+    let dist = min(abs(signedDist), U.depthRange);
+    if (isBackface) { backfaceCount = backfaceCount + 1u; }
+    // Seed must match the RT pass exactly — directions encode the radiance.
+    let d = fibSphere(i, raysPer, U.frameSeed + f32(probeIdx) * 0.61803);
+    // Skip backface samples in SH projection — they represent rays trapped
+    // inside geometry, contributing junk radiance that distorts neighbours
+    // when the trapped probe later seeds an indirect bounce.
+    if (!isBackface) {
+      let rw = radiance * weight;
+      sh[0] = sh[0] + rw * 0.282095;
+      sh[1] = sh[1] + rw * (0.488603 * d.y);
+      sh[2] = sh[2] + rw * (0.488603 * d.z);
+      sh[3] = sh[3] + rw * (0.488603 * d.x);
+      sh[4] = sh[4] + rw * (1.092548 * d.x * d.y);
+      sh[5] = sh[5] + rw * (1.092548 * d.y * d.z);
+      sh[6] = sh[6] + rw * (0.315392 * (3.0 * d.z * d.z - 1.0));
+      sh[7] = sh[7] + rw * (1.092548 * d.x * d.z);
+      sh[8] = sh[8] + rw * (0.546274 * (d.x * d.x - d.y * d.y));
+    }
+    depthSum   = depthSum   + dist;
+    depthSumSq = depthSumSq + dist * dist;
+  }
+
+  // If >10% of rays hit backfaces, the probe is buried in (or grazing) geometry.
+  // Lowered from 0.25 because a probe whose center sits just outside a face
+  // still slips through with ~10–20% backface rays and contributes flat/dim SH
+  // that pulls dark spots onto neighbouring surfaces during trilinear blending.
+  let backfaceRatio = f32(backfaceCount) / f32(raysPer);
+  let trapped = backfaceRatio > 0.10;
+
+  for (var k: u32 = 0u; k < 9u; k = k + 1u) {
+    if (trapped) {
+      probeSH[probeIdx * 9u + k] = vec4<f32>(0.0);
+    } else {
+      let scaled = clamp(sh[k], vec3<f32>(-64.0), vec3<f32>(64.0));
+      probeSH[probeIdx * 9u + k] = vec4<f32>(scaled, 0.0);
+    }
+  }
+  let meanD   = clamp(depthSum   / f32(raysPer), 0.0, U.depthRange);
+  let meanDSq = max(meanD * meanD, clamp(depthSumSq / f32(raysPer), 0.0, U.depthRange * U.depthRange));
+  probeDepth[probeIdx] = vec4<f32>(meanD, meanDSq, 0.0, select(0.0, 1.0, trapped));
+}
+`;
+
+  // Neighbour-seed pass: trapped probes (probeDepth.w == 1.0) are reseeded
+  // with the average DC ambient of their 6 axis-neighbours. Runs after
+  // integrate; reads probeSH/probeDepth in place. Only band 0 is seeded —
+  // higher bands stay zero, which makes trapped probes contribute pure
+  // ambient (no directional information) and the Chebyshev test in the
+  // fragment shader still culls them correctly because their depth moments
+  // remain set to "very close" from being inside geometry.
+  const SEED_WGSL = /* wgsl */`
+struct SeedUniforms {
+  dims: vec4<u32>,    // xyz=probe dims, w=numProbes
+};
+@group(0) @binding(0) var<uniform> U: SeedUniforms;
+@group(0) @binding(1) var<storage, read_write> probeSH:    array<vec4<f32>>;
+@group(0) @binding(2) var<storage, read>       probeDepth: array<vec4<f32>>;
+
+fn flatIdx(x: i32, y: i32, z: i32) -> i32 {
+  let dx = i32(U.dims.x);
+  let dy = i32(U.dims.y);
+  return z * dx * dy + y * dx + x;
+}
+
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let probeIdx = gid.x;
+  if (probeIdx >= U.dims.w) { return; }
+  let trapped = probeDepth[probeIdx].w > 0.5;
+  if (!trapped) { return; }
+
+  let dx = i32(U.dims.x);
+  let dy = i32(U.dims.y);
+  let dz = i32(U.dims.z);
+  // Decompose flat probeIdx -> (x,y,z) using the layout
+  // flatIdx = z*dx*dy + y*dx + x.
+  let z = i32(probeIdx) / (dx * dy);
+  let y = (i32(probeIdx) - z * dx * dy) / dx;
+  let x = i32(probeIdx) - z * dx * dy - y * dx;
+
+  var sum = vec3<f32>(0.0);
+  var count = 0.0;
+  // 6 axis-neighbours.
+  let off = array<vec3<i32>, 6>(
+    vec3<i32>(-1, 0, 0), vec3<i32>(1, 0, 0),
+    vec3<i32>(0, -1, 0), vec3<i32>(0, 1, 0),
+    vec3<i32>(0, 0, -1), vec3<i32>(0, 0, 1)
+  );
+  for (var i: u32 = 0u; i < 6u; i = i + 1u) {
+    let o = off[i];
+    let nx = x + o.x;
+    let ny = y + o.y;
+    let nz = z + o.z;
+    if (nx < 0 || nx >= dx) { continue; }
+    if (ny < 0 || ny >= dy) { continue; }
+    if (nz < 0 || nz >= dz) { continue; }
+    let nIdx = flatIdx(nx, ny, nz);
+    if (probeDepth[nIdx].w > 0.5) { continue; } // skip other trapped probes
+    sum = sum + probeSH[u32(nIdx) * 9u].xyz;    // band-0 only
+    count = count + 1.0;
+  }
+  if (count > 0.0) {
+    let avg = sum / count;
+    probeSH[probeIdx * 9u] = vec4<f32>(avg, 0.0);
+  }
+  // Higher bands stay zeroed from the integrate pass — gives pure ambient.
+}
+`;
+
+  const rtModule = device.createShaderModule({ label: 'ddgi-rt', code: RT_WGSL });
+  const intModule = device.createShaderModule({ label: 'ddgi-integrate', code: INTEGRATE_WGSL });
+  const seedModule = device.createShaderModule({ label: 'ddgi-seed', code: SEED_WGSL });
+  // Surface compilation diagnostics — WebGPU's uncaptured-error log truncates
+  // the message and doesn't include line numbers. getCompilationInfo() returns
+  // structured (lineNum, linePos, message) records we can format ourselves.
+  for (const [label, mod, src] of [['ddgi-rt', rtModule, RT_WGSL], ['ddgi-integrate', intModule, INTEGRATE_WGSL], ['ddgi-seed', seedModule, SEED_WGSL]]) {
+    mod.getCompilationInfo().then(info => {
+      if (!info.messages.length) return;
+      const lines = src.split('\n');
+      for (const msg of info.messages) {
+        const ln = msg.lineNum;
+        const ctx = lines.slice(Math.max(0, ln - 2), ln + 1).map((l, i) => `${ln - 1 + i}: ${l}`).join('\n');
+        console[msg.type === 'error' ? 'error' : 'warn'](`[${label}] ${msg.type} L${ln}:${msg.linePos}: ${msg.message}\n${ctx}`);
+      }
+    });
+  }
+
+  const rtPipeline = device.createComputePipeline({
+    label: 'ddgi-rt-pipeline',
+    layout: 'auto',
+    compute: { module: rtModule, entryPoint: 'main' },
+  });
+  const intPipeline = device.createComputePipeline({
+    label: 'ddgi-int-pipeline',
+    layout: 'auto',
+    compute: { module: intModule, entryPoint: 'main' },
+  });
+  const seedPipeline = device.createComputePipeline({
+    label: 'ddgi-seed-pipeline',
+    layout: 'auto',
+    compute: { module: seedModule, entryPoint: 'main' },
+  });
+
+  // Seed-pass uniforms: probe dims (x,y,z,numProbes).
+  const seedUniBuf = device.createBuffer({
+    label: 'seed-uniforms',
+    size: 16,
+    usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+  });
+  {
+    const dv = new DataView(new ArrayBuffer(16));
+    dv.setUint32(0, PROBE_DIMS.x, true);
+    dv.setUint32(4, PROBE_DIMS.y, true);
+    dv.setUint32(8, PROBE_DIMS.z, true);
+    dv.setUint32(12, PROBE_COUNT, true);
+    device.queue.writeBuffer(seedUniBuf, 0, dv.buffer);
+  }
+
+  const rtBindGroup = device.createBindGroup({
+    layout: rtPipeline.getBindGroupLayout(0),
+    entries: [
+      { binding: 0, resource: { buffer: rtUniBuf } },
+      { binding: 1, resource: { buffer: bvhNodeBuf } },
+      { binding: 2, resource: { buffer: bvhIdxBuf } },
+      { binding: 3, resource: { buffer: triBuf } },
+      { binding: 4, resource: { buffer: triMatBuf } },
+      { binding: 5, resource: { buffer: probePosBuf } },
+      { binding: 6, resource: { buffer: probeSHBuf } },
+      { binding: 7, resource: { buffer: rayHitsBuf } },
+    ],
+  });
+
+  const WEBGPU_DEPTH_RANGE = 50;
+  const intUniBuf = device.createBuffer({
+    label: 'integrate-uniforms',
+    size: 16,
+    usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+  });
+  const intUniArr = new ArrayBuffer(16);
+  const intUniDV = new DataView(intUniArr);
+  function writeIntegrateUniforms(seed) {
+    intUniDV.setUint32(0, RAYS_PER_PROBE, true);
+    intUniDV.setUint32(4, PROBE_COUNT, true);
+    intUniDV.setFloat32(8, WEBGPU_DEPTH_RANGE, true);
+    intUniDV.setFloat32(12, seed, true);
+    device.queue.writeBuffer(intUniBuf, 0, intUniArr);
+  }
+  writeIntegrateUniforms(0);
+
+  const intBindGroup = device.createBindGroup({
+    layout: intPipeline.getBindGroupLayout(0),
+    entries: [
+      { binding: 0, resource: { buffer: intUniBuf } },
+      { binding: 1, resource: { buffer: rayHitsBuf } },
+      { binding: 2, resource: { buffer: probeSHBuf } },
+      { binding: 3, resource: { buffer: probeDepthBuf } },
+    ],
+  });
+
+  const seedBindGroup = device.createBindGroup({
+    layout: seedPipeline.getBindGroupLayout(0),
+    entries: [
+      { binding: 0, resource: { buffer: seedUniBuf } },
+      { binding: 1, resource: { buffer: probeSHBuf } },
+      { binding: 2, resource: { buffer: probeDepthBuf } },
+    ],
+  });
+
+  // ---------- TSL fragment graph (reuses the existing trilinear-SH path) ----------
+  // We allocate the SH and depth uniformArrays the same way createWebGPUScene
+  // does; the only difference is they're populated by the RT pipeline above
+  // instead of CPU-integrated cubemaps.
+  const SH_COEFFS = 9;
+  const probeSHFlat = [];
+  for (let i = 0; i < PROBE_COUNT * SH_COEFFS; i++) probeSHFlat.push(new THREE.Vector3());
+  const probeDepthMeanArr   = new Array(PROBE_COUNT).fill(100.0);
+  const probeDepthMeanSqArr = new Array(PROBE_COUNT).fill(10000.0);
+
+  let uGiMode, uGiEnabled, uGiIntensity, uGiPiFactor, uGiTransportMode;
+  let uProbeMin, uProbeMax, uProbeDims;
+  let uChebyshevEnabled, uDepthBias, uChebyshevFloor;
+  bc('building TSL GI graph');
+  try {
+    const { Fn, vec3, float, int, uniform, uniformArray, positionWorld, normalWorld } = TSL;
+    uProbeMin    = uniform(PROBE_MIN.clone());
+    uProbeMax    = uniform(PROBE_MAX.clone());
+    uProbeDims   = uniform(PROBE_DIMS.clone());
+    // Default 2.0: ACES tonemapping at exposure 1.3 compresses small bleed
+    // contributions (typically 0.05–0.2) below visible-difference threshold
+    // when direct light is at ~1.0. Doubling the multiplier puts colored
+    // bleed above the noise floor of the tonemap curve.
+    uGiIntensity = uniform(2.0);
+    uGiEnabled   = uniform(1.0);
+    uGiMode      = uniform(5.0);
+    uGiPiFactor  = uniform(1.0);
+    uGiTransportMode = uniform(2); // diffuse irradiance — the engine path
+
+    const probeSHArray  = uniformArray(probeSHFlat, 'vec3');
+    const uDepthMean    = uniformArray(probeDepthMeanArr, 'float');
+    const uDepthMeanSq  = uniformArray(probeDepthMeanSqArr, 'float');
+    // Per-probe trapped flag (0 = healthy, 1 = inside/grazing geometry). Used
+    // in the trilinear loop to zero a buried probe's contribution.
+    probeTrappedFloatArr = new Array(PROBE_COUNT).fill(0.0);
+    const uProbeTrapped = uniformArray(probeTrappedFloatArr, 'float');
+    uChebyshevEnabled   = uniform(1.0);
+    uDepthBias          = uniform(0.12);
+    uChebyshevFloor     = uniform(0.0);
+
+    const readSH = (pi, k) => probeSHArray.element(int(pi).mul(int(9)).add(int(k)));
+    const evalSH = (n, pi) => {
+      const x = n.x, y = n.y, z = n.z;
+      const c0 = readSH(pi, 0), c1 = readSH(pi, 1), c2 = readSH(pi, 2);
+      const c3 = readSH(pi, 3), c4 = readSH(pi, 4), c5 = readSH(pi, 5);
+      const c6 = readSH(pi, 6), c7 = readSH(pi, 7), c8 = readSH(pi, 8);
+      return c0.mul(0.886227)
+        .add(c1.mul(2.0 * 0.511664).mul(y))
+        .add(c2.mul(2.0 * 0.511664).mul(z))
+        .add(c3.mul(2.0 * 0.511664).mul(x))
+        .add(c4.mul(2.0 * 0.429043).mul(x).mul(y))
+        .add(c5.mul(2.0 * 0.429043).mul(y).mul(z))
+        .add(c6.mul(z.mul(z).mul(0.743125).sub(0.247708)))
+        .add(c7.mul(2.0 * 0.429043).mul(x).mul(z))
+        .add(c8.mul(0.429043).mul(x.mul(x).sub(y.mul(y))));
+    };
+
+    const giSampleFn = Fn(([wp, n]) => {
+      const grid = wp.sub(uProbeMin).div(uProbeMax.sub(uProbeMin))
+                   .clamp(vec3(0.0), vec3(1.0))
+                   .mul(uProbeDims.sub(vec3(1.0)));
+      const baseIdx = grid.min(uProbeDims.sub(vec3(1.0001))).floor();
+      const fracIdx = grid.sub(baseIdx).clamp(vec3(0.0), vec3(1.0));
+      const probeSpacing = uProbeMax.sub(uProbeMin).div(uProbeDims.sub(vec3(1.0)));
+      const Dx   = uProbeDims.x;
+      const DxDy = uProbeDims.x.mul(uProbeDims.y);
+      const wpBiased = wp.add(n.mul(uDepthBias));
+      let sum = vec3(0.0).toVar();
+      let wSum = float(0.0).toVar();
+      for (let cz = 0; cz < 2; cz++) for (let cy = 0; cy < 2; cy++) for (let cx = 0; cx < 2; cx++) {
+        const ix = baseIdx.x.add(float(cx));
+        const iy = baseIdx.y.add(float(cy));
+        const iz = baseIdx.z.add(float(cz));
+        const tx = cx === 0 ? float(1.0).sub(fracIdx.x) : fracIdx.x;
+        const ty = cy === 0 ? float(1.0).sub(fracIdx.y) : fracIdx.y;
+        const tz = cz === 0 ? float(1.0).sub(fracIdx.z) : fracIdx.z;
+        const sx = tx.mul(tx).mul(float(3.0).sub(tx.mul(2.0)));
+        const sy = ty.mul(ty).mul(float(3.0).sub(ty.mul(2.0)));
+        const sz = tz.mul(tz).mul(float(3.0).sub(tz.mul(2.0)));
+        const triWeight = sx.mul(sy).mul(sz);
+        const flatF = iz.mul(DxDy).add(iy.mul(Dx)).add(ix);
+        const piInt = int(flatF);
+        const pi    = float(flatF);
+        const idxV       = vec3(ix, iy, iz);
+        const probeWorld = uProbeMin.add(idxV.mul(probeSpacing));
+        const dist       = wpBiased.sub(probeWorld).length();
+        const dMean      = uDepthMean.element(piInt);
+        const dMeanSq    = uDepthMeanSq.element(piInt);
+        const variance   = dMeanSq.sub(dMean.mul(dMean)).max(float(1e-4));
+        const distExcess = dist.sub(dMean).max(float(0.0));
+        // Square Chebyshev to sharpen partial-visibility falloff.
+        const chebyshevRaw = variance.div(variance.add(distExcess.mul(distExcess))).clamp(0.0, 1.0);
+        const chebyshev    = chebyshevRaw.mul(chebyshevRaw);
+        const visWeight  = uChebyshevFloor.mix(chebyshev, uChebyshevEnabled).max(uChebyshevFloor);
+        // Hard trap mask: trapped probes contribute zero. Apply *after* the
+        // per-corner floor so the floor doesn't pull the weight back up.
+        const trappedFlag = uProbeTrapped.element(piInt);
+        const aliveMask   = float(1.0).sub(trappedFlag);
+        const weight     = triWeight.mul(visWeight).max(float(1e-5)).mul(aliveMask);
+        // No X mirror here — the RT projection in INTEGRATE_WGSL uses
+        // world-space fibSphere directions directly, so reconstruction must
+        // also use the unmodified surface normal. (The legacy webgpu scene
+        // mirrors X to compensate for the cube-camera face convention; that
+        // path doesn't apply when the projection is done analytically.)
+        const irrRaw  = evalSH(n, pi);
+        const c0Amb   = readSH(pi, 0).mul(0.886227).max(vec3(0.0));
+        // Chromaticity-aware ringing detector: only blend back to DC ambient
+        // when the negative magnitude is large *relative to the strongest
+        // positive channel*. A weak negative (~SH discreteness) beside a
+        // strong positive (legitimate bleed) is normal — desaturating it
+        // crushes colored bleed into gray.
+        const maxCh   = irrRaw.x.max(irrRaw.y).max(irrRaw.z).max(float(1e-3));
+        const minCh   = irrRaw.x.min(irrRaw.y).min(irrRaw.z);
+        const negDepth= minCh.negate().max(float(0.0));
+        const ringing = negDepth.div(maxCh).clamp(float(0.0), float(1.0));
+        const irr     = irrRaw.max(vec3(0.0)).mix(c0Amb, ringing);
+        sum  = sum.add(irr.mul(weight));
+        wSum = wSum.add(weight);
+      }
+      return sum.div(wSum.max(float(1e-4)));
+    });
+
+    for (const m of [matWhite, matRed, matGreen, matBox]) {
+      const N = normalWorld.normalize();
+      const giRaw = giSampleFn(positionWorld, N);
+      const giIrradiance = giRaw.max(vec3(0.0));
+      m.ddgiIrradianceNode = giIrradiance.mul(uGiEnabled).mul(uGiIntensity);
+    }
+    bc('TSL GI graph built (RT path)');
+  } catch (e) {
+    bc('TSL graph FAILED: ' + e.message);
+    console.error(e);
+  }
+
+  // ---------- Bake orchestration ----------
+  // One bake = run RT compute, run integrate compute, copy SH+depth back to
+  // CPU, push into the uniformArrays that feed the fragment shader. Multiple
+  // bounces = repeat: each pass reads the *previous* SH from probeSHBuf as
+  // the indirect cache, and overwrites it with the new SH.
+
+  let bakeInFlight = false;
+  let bakeRequested = false;
+  let frameSeed = 0;
+  const stats = new Stats();
+
+  async function bakeOnce(indirectScale) {
+    frameSeed = (frameSeed + 1) & 0xffff;
+    packRTUniforms(frameSeed, indirectScale);
+    writeIntegrateUniforms(frameSeed);
+
+    const enc = device.createCommandEncoder({ label: 'ddgi-bake' });
+    {
+      const pass = enc.beginComputePass({ label: 'rt-pass' });
+      pass.setPipeline(rtPipeline);
+      pass.setBindGroup(0, rtBindGroup);
+      pass.dispatchWorkgroups(Math.ceil(TOTAL_RAYS / 64));
+      pass.end();
+    }
+    {
+      const pass = enc.beginComputePass({ label: 'integrate-pass' });
+      pass.setPipeline(intPipeline);
+      pass.setBindGroup(0, intBindGroup);
+      pass.dispatchWorkgroups(Math.ceil(PROBE_COUNT / 64));
+      pass.end();
+    }
+    {
+      // Seed-pass: trapped probes get DC ambient from their 6 axis-neighbours
+      // so they contribute pure ambient instead of zero (which would create
+      // dark pockets if Chebyshev visibility ever fails on a fragment query).
+      const pass = enc.beginComputePass({ label: 'seed-pass' });
+      pass.setPipeline(seedPipeline);
+      pass.setBindGroup(0, seedBindGroup);
+      pass.dispatchWorkgroups(Math.ceil(PROBE_COUNT / 64));
+      pass.end();
+    }
+    enc.copyBufferToBuffer(probeSHBuf, 0, probeSHReadBuf, 0, probeSHBufBytes);
+    enc.copyBufferToBuffer(probeDepthBuf, 0, probeDepthReadBuf, 0, PROBE_COUNT * 16);
+    // Debug: copy the chosen probe's slice of rayHits into the staging buffer.
+    enc.copyBufferToBuffer(rayHitsBuf, DEBUG_PROBE_IDX * RAYS_PER_PROBE * 16,
+                           debugRayReadBuf, 0, RAYS_PER_PROBE * 16);
+    device.queue.submit([enc.finish()]);
+
+    await Promise.all([
+      probeSHReadBuf.mapAsync(GPUMapMode.READ),
+      probeDepthReadBuf.mapAsync(GPUMapMode.READ),
+      debugRayReadBuf.mapAsync(GPUMapMode.READ),
+    ]);
+    const shView = new Float32Array(probeSHReadBuf.getMappedRange());
+    const dView  = new Float32Array(probeDepthReadBuf.getMappedRange());
+    for (let p = 0; p < PROBE_COUNT; p++) {
+      for (let k = 0; k < 9; k++) {
+        const off = (p * 9 + k) * 4;
+        probeSHFlat[p * 9 + k].set(shView[off+0], shView[off+1], shView[off+2]);
+      }
+      probeDepthMeanArr[p]   = dView[p * 4 + 0];
+      probeDepthMeanSqArr[p] = dView[p * 4 + 1];
+      const trapped = dView[p * 4 + 3] > 0.5;
+      probeTrappedFlags[p]   = trapped;
+      if (probeTrappedFloatArr) probeTrappedFloatArr[p] = trapped ? 1.0 : 0.0;
+    }
+    // Debug: pull this probe's rays out and rebuild the line visualization.
+    const rayView = new Float32Array(debugRayReadBuf.getMappedRange());
+    const debugRays = new Float32Array(rayView); // copy out before unmap
+    debugRayReadBuf.unmap();
+    probeSHReadBuf.unmap();
+    probeDepthReadBuf.unmap();
+    stats.totalProbeUpdates += PROBE_COUNT;
+    updateDebugProbeColors();
+    updateDebugRayLines(debugRays, frameSeed, DEBUG_PROBE_IDX);
+  }
+
+  // Mirror of WGSL fibSphere — must produce identical directions per ray.
+  function fibSphereJS(rayI, total, seed) {
+    const golden = 0.5 * (Math.sqrt(5.0) - 1.0);
+    const i = rayI + 0.5 + seed;
+    const phi = 2.0 * Math.PI * (i * golden - Math.floor(i * golden));
+    const cosTheta = 1.0 - 2.0 * (i / total);
+    const sinTheta = Math.sqrt(Math.max(0.0, 1.0 - cosTheta * cosTheta));
+    return [Math.cos(phi) * sinTheta, Math.sin(phi) * sinTheta, cosTheta];
+  }
+
+  // Single line-segments mesh, rebuilt each bake. Each segment goes from the
+  // probe origin out along the ray direction, length = clamped hit distance.
+  // Colour = clamped radiance the ray captured (so red bleed shows up red).
+  const debugRayGeo = new THREE.BufferGeometry();
+  const debugRayPositions = new Float32Array(RAYS_PER_PROBE * 2 * 3);
+  const debugRayColors    = new Float32Array(RAYS_PER_PROBE * 2 * 3);
+  debugRayGeo.setAttribute('position', new THREE.BufferAttribute(debugRayPositions, 3).setUsage(THREE.DynamicDrawUsage));
+  debugRayGeo.setAttribute('color',    new THREE.BufferAttribute(debugRayColors, 3).setUsage(THREE.DynamicDrawUsage));
+  const debugRayMat = new THREE.LineBasicMaterial({ vertexColors: true, transparent: true, depthTest: false });
+  const debugRayLines = new THREE.LineSegments(debugRayGeo, debugRayMat);
+  debugRayLines.frustumCulled = false;
+  debugRayLines.renderOrder = 999;
+  scene.add(debugRayLines);
+
+  function updateDebugRayLines(rayData, frameSeed, probeIdx) {
+    const probe = probePositions[probeIdx];
+    // Seed must match RT pass exactly: U.rtMeta.z + probeIdx * 0.61803.
+    const seed = frameSeed + probeIdx * 0.61803;
+    const posAttr = debugRayGeo.attributes.position;
+    const colAttr = debugRayGeo.attributes.color;
+    for (let i = 0; i < RAYS_PER_PROBE; i++) {
+      const dir = fibSphereJS(i, RAYS_PER_PROBE, seed);
+      const r = rayData[i * 4 + 0];
+      const g = rayData[i * 4 + 1];
+      const b = rayData[i * 4 + 2];
+      const signedDist = rayData[i * 4 + 3];
+      const dist = Math.min(Math.abs(signedDist), 2.0); // clip to keep lines short
+      const o = i * 6;
+      // segment start: probe centre
+      posAttr.array[o + 0] = probe.x;
+      posAttr.array[o + 1] = probe.y;
+      posAttr.array[o + 2] = probe.z;
+      // segment end: probe + dir * dist
+      posAttr.array[o + 3] = probe.x + dir[0] * dist;
+      posAttr.array[o + 4] = probe.y + dir[1] * dist;
+      posAttr.array[o + 5] = probe.z + dir[2] * dist;
+      // colour: clamp radiance to [0,1] for display; both endpoints same colour
+      const cr = Math.min(1.0, r);
+      const cg = Math.min(1.0, g);
+      const cb = Math.min(1.0, b);
+      colAttr.array[o + 0] = cr; colAttr.array[o + 1] = cg; colAttr.array[o + 2] = cb;
+      colAttr.array[o + 3] = cr; colAttr.array[o + 4] = cg; colAttr.array[o + 5] = cb;
+    }
+    posAttr.needsUpdate = true;
+    colAttr.needsUpdate = true;
+  }
+
+  async function bakeAllProbes(bounces = 2) {
+    if (bakeInFlight) { bakeRequested = true; return; }
+    bakeInFlight = true;
+    try {
+      do {
+        bakeRequested = false;
+        // First bounce reads zero SH; second+ reads the previous bounce. The
+        // indirect scale starts at 0 (so the first bake captures pure direct
+        // light) and ramps to 1 on subsequent bakes.
+        for (let b = 0; b < bounces; b++) {
+          await bakeOnce(b === 0 ? 0.0 : 1.0);
+          bc(`RT bake bounce ${b + 1}/${bounces}`);
+        }
+      } while (bakeRequested);
+    } finally {
+      bakeInFlight = false;
+    }
+  }
+
+  let rebakeTimer = 0;
+  function scheduleRebake() {
+    if (rebakeTimer) window.clearTimeout(rebakeTimer);
+    rebakeTimer = window.setTimeout(() => { rebakeTimer = 0; bakeAllProbes(params.bounces); }, 200);
+  }
+
+  // ---------- GUI ----------
+  const params = {
+    giEnabled: true,
+    giIntensity: 2.0,
+    chebyshevEnabled: true,
+    depthBias: 0.12,
+    chebyshevFloor: 0.0,
+    keyIntensity: keyLight.intensity,
+    keyColor: '#' + keyLight.color.getHexString(),
+    keyHeight: keyLight.position.y,
+    panelR: uPanelColor.value.x, panelG: uPanelColor.value.y, panelB: uPanelColor.value.z,
+    wallRed:   '#' + matRed.color.getHexString(),
+    wallGreen: '#' + matGreen.color.getHexString(),
+    wallWhite: '#' + matWhite.color.getHexString(),
+    bounces: 4,
+    showProbes: false,
+    rebake: () => bakeAllProbes(params.bounces),
+  };
+  const gui = new GUI({ title: 'DDGI · WebGPU raytraced', width: 320 });
+
+  const fGI = gui.addFolder('GI');
+  fGI.add(params, 'giEnabled').name('GI enabled').onChange(v => uGiEnabled.value = v ? 1 : 0);
+  fGI.add(params, 'giIntensity', 0, 3, 0.05).name('GI intensity').onChange(v => uGiIntensity.value = v);
+  fGI.add(params, 'chebyshevEnabled').name('Chebyshev visibility').onChange(v => {
+    uChebyshevEnabled.value = v ? 1 : 0;
+    if (v) scheduleRebake();
+  });
+  fGI.add(params, 'depthBias', 0, 0.5, 0.005).name('Depth bias').onChange(v => uDepthBias.value = v);
+  fGI.add(params, 'chebyshevFloor', 0, 1, 0.01).name('Cheby floor').onChange(v => uChebyshevFloor.value = v);
+  fGI.add(params, 'bounces', 1, 4, 1).name('Bounces / bake');
+  fGI.add(params, 'rebake').name('Rebake GI');
+
+  const fLight = gui.addFolder('Light');
+  fLight.add(params, 'keyIntensity', 0, 20, 0.05).name('Key intensity').onChange(v => { keyLight.intensity = v; scheduleRebake(); });
+  fLight.addColor(params, 'keyColor').name('Key color').onChange(v => { keyLight.color.set(v); scheduleRebake(); });
+  fLight.add(params, 'keyHeight', 0.1, 2*BOX.y - 0.05, 0.01).name('Key height').onChange(v => { keyLight.position.y = v; scheduleRebake(); });
+  const setPanelAndRebake = () => { uPanelColor.value.set(params.panelR, params.panelG, params.panelB); scheduleRebake(); };
+  fLight.add(params, 'panelR', 0, 20, 0.05).name('Panel R').onChange(setPanelAndRebake);
+  fLight.add(params, 'panelG', 0, 20, 0.05).name('Panel G').onChange(setPanelAndRebake);
+  fLight.add(params, 'panelB', 0, 20, 0.05).name('Panel B').onChange(setPanelAndRebake);
+
+  const fWalls = gui.addFolder('Walls');
+  fWalls.addColor(params, 'wallRed').name('Red wall').onChange(v => { matRed.color.set(v); scheduleRebake(); });
+  fWalls.addColor(params, 'wallGreen').name('Green wall').onChange(v => { matGreen.color.set(v); scheduleRebake(); });
+  fWalls.addColor(params, 'wallWhite').name('White walls').onChange(v => { matWhite.color.set(v); scheduleRebake(); });
+
+  const fView = gui.addFolder('View');
+  fView.add(params, 'showProbes').name('Show probes').onChange(v => debugProbeGroup.visible = v);
+
+  // ---------- Initial bake + render loop ----------
+  // Hide the canvas until the first bake settles so the user never sees the
+  // black-no-GI intermediate state. The status overlay (managed by loadScene)
+  // remains on top showing the bake progress breadcrumbs.
+  canvas.style.visibility = 'hidden';
+  bc('initial RT bake (4 bounces)…');
+  await bakeAllProbes(params.bounces);
+  bc('initial bake done');
+
+  const clock = new THREE.Clock();
+  let rafId, stopped = false, firstFrame = true;
+  async function tick() {
+    if (stopped) return;
+    const dt = clock.getDelta();
+    controls.update();
+    try {
+      await renderer.renderAsync(scene, camera);
+      if (firstFrame) {
+        firstFrame = false;
+        bc('first renderAsync OK');
+        canvas.style.visibility = 'visible';
+      }
+    } catch (e) {
+      stopped = true;
+      console.error(e);
+      statusEl.classList.add('show');
+      statusEl.innerHTML = `<span class="err"><b>Render failed</b><br>${e.message || e}</span>`;
+      return;
+    }
+    stats.tick(dt);
+    if (!stopped) rafId = requestAnimationFrame(tick);
+  }
+  bc('starting render loop');
+  tick();
+
+  const onResize = () => {
+    camera.aspect = window.innerWidth / window.innerHeight;
+    camera.updateProjectionMatrix();
+    renderer.setSize(window.innerWidth, window.innerHeight);
+  };
+  window.addEventListener('resize', onResize);
+
+  bc('createWebGPURTScene done');
+  return {
+    dispose() {
+      stopped = true;
+      cancelAnimationFrame(rafId);
+      if (rebakeTimer) window.clearTimeout(rebakeTimer);
+      window.removeEventListener('resize', onResize);
+      gui.destroy();
+      controls.dispose();
+      [bvhNodeBuf, bvhIdxBuf, triBuf, triMatBuf, probePosBuf, rayHitsBuf,
+       probeSHBuf, probeDepthBuf, probeSHReadBuf, probeDepthReadBuf,
+       rtUniBuf, intUniBuf, seedUniBuf].forEach(b => { try { b.destroy(); } catch (e) { /* ok */ } });
       scene.traverse(o => {
         if (o.geometry) o.geometry.dispose();
         if (o.material) {
@@ -1286,9 +3116,9 @@ vec3 ddgi_sampleGrid( vec3 wp, vec3 n ) {
   }
   function shBasis(d) {
     const x=d.x, y=d.y, z=d.z;
-    return [0.282095, -0.488603*y, 0.488603*z, -0.488603*x,
-            1.092548*x*y, -1.092548*y*z, 0.315392*(3*z*z-1),
-            -1.092548*x*z, 0.546274*(x*x-y*y)];
+      return [0.282095, 0.488603*y, 0.488603*z, 0.488603*x,
+        1.092548*x*y, 1.092548*y*z, 0.315392*(3*z*z-1),
+        1.092548*x*z, 0.546274*(x*x-y*y)];
   }
   for (let f=0; f<6; f++) {
     const arr = [];
