@@ -1837,6 +1837,19 @@ async function createWebGPURTScene(canvas) {
   // bounce lookup sees zero, not garbage.
   device.queue.writeBuffer(probeOctBuf, 0, new Float32Array(probeOctBufBytes / 4));
 
+  // Snapshot of probeOctBuf at the start of each bake. The integrate shader
+  // blends the new estimate against this (not against the live probeOctBuf,
+  // which gets clobbered by intermediate bounces of the same bake), so
+  // hysteresis actually compares "this bake's final result" to "previous
+  // bake's final result". Populated by enc.copyBufferToBuffer at the top of
+  // bakeAllProbes.
+  const probeOctPrevBuf = device.createBuffer({
+    label: 'probe-oct-prev',
+    size: probeOctBufBytes,
+    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+  });
+  device.queue.writeBuffer(probeOctPrevBuf, 0, new Float32Array(probeOctBufBytes / 4));
+
   const probeDepthBuf = device.createBuffer({
     label: 'probe-depth-moments',
     size: PROBE_COUNT * 16, // vec4: mean, meanSq, _, _
@@ -2276,12 +2289,17 @@ struct IntUniforms {
   raysPerProbe: u32,
   numProbes: u32,
   depthRange: f32,
-  frameSeed: f32, // must match RT pass — directions are seed-deterministic
+  frameSeed: f32,    // must match RT pass — directions are seed-deterministic
+  hysteresis: f32,   // per-frame retention for octahedral blend; 0 = full replace
+  firstBake: f32,    // 1.0 on the very first bake so we don't fade in from black
+  _pad0: f32,
+  _pad1: f32,
 };
 @group(0) @binding(0) var<uniform> U: IntUniforms;
 @group(0) @binding(1) var<storage, read> rayHits: array<vec4<f32>>;
 @group(0) @binding(2) var<storage, read_write> probeOct: array<vec4<f32>>;    // 64 vec4/probe (8x8)
 @group(0) @binding(3) var<storage, read_write> probeDepth: array<vec4<f32>>;  // mean,meanSq,_,trapped
+@group(0) @binding(4) var<storage, read>       probeOctPrev: array<vec4<f32>>; // snapshot at bake start
 
 const PI: f32 = 3.14159265358979;
 const OCT_RES: u32 = 8u;
@@ -2336,6 +2354,13 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let backfaceRatio = f32(backfaceCount) / f32(raysPer);
   let trapped = backfaceRatio > 0.02;
 
+  // Was-this-probe-trapped-last-frame? Stored in the prior probeDepth.w. If a
+  // probe transitions trapped -> active we want to ignore the stale octahedral
+  // (it was zeroed by the integrate pass and then seeded from neighbours) and
+  // start fresh this frame instead of blending in the seed value.
+  let wasTrapped = probeDepth[probeIdx].w > 0.5;
+  let justUntrapped = wasTrapped && !trapped;
+
   let meanD   = clamp(depthSum   / f32(raysPer), 0.0, U.depthRange);
   let meanDSq = max(meanD * meanD, clamp(depthSumSq / f32(raysPer), 0.0, U.depthRange * U.depthRange));
   probeDepth[probeIdx] = vec4<f32>(meanD, meanDSq, 0.0, select(0.0, 1.0, trapped));
@@ -2368,7 +2393,18 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
       let irr = num / max(den, 1e-4);
       // Modest clamp to keep a pathological hot-spike from blowing the cache.
       let clamped = clamp(irr, vec3<f32>(0.0), vec3<f32>(8.0));
-      probeOct[outIdx] = vec4<f32>(clamped, 0.0);
+
+      // Temporal hysteresis: blend new estimate into the *previous bake's*
+      // final value (snapshot taken at bake start, so multi-bounce passes
+      // within this bake don't contaminate the blend target). With 256
+      // rays/probe/frame each frame is a noisy Monte Carlo estimate;
+      // blending lets effective sample count grow over time. Skip on the
+      // first bake (probeOctPrev is zeros), when hysteresis is disabled
+      // (intermediate bounces), and when this probe just un-trapped.
+      let prev = probeOctPrev[outIdx].xyz;
+      let useHist = U.hysteresis * (1.0 - U.firstBake) * select(1.0, 0.0, justUntrapped);
+      let blended = mix(clamped, prev, useHist);
+      probeOct[outIdx] = vec4<f32>(blended, 0.0);
     }
   }
 }
@@ -2506,16 +2542,33 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   const WEBGPU_DEPTH_RANGE = 50;
   const intUniBuf = device.createBuffer({
     label: 'integrate-uniforms',
-    size: 16,
+    size: 32,
     usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
   });
-  const intUniArr = new ArrayBuffer(16);
+  const intUniArr = new ArrayBuffer(32);
   const intUniDV = new DataView(intUniArr);
+  // hasBakedOnce flips to true after the first bakeOnce completes; until then
+  // every integrate dispatch passes firstBake=1.0 so we don't fade in from
+  // black through hysteresis. hysteresisValue is updated by the GUI slider
+  // (params.giHysteresis is created later, so we use a free variable here
+  // to avoid TDZ on the initial writeIntegrateUniforms call below).
+  let hasBakedOnce = false;
+  let hysteresisValue = 0.97;
+  // Hysteresis only applies to the *last* bounce of a bake — earlier bounces
+  // resolve multi-bounce light transport within the same frame and must do
+  // full replace, otherwise each bounce blends with the last bounce at α=0.97
+  // and fresh radiance is exponentially diluted (causing visible flashing
+  // when lights change). Set by bakeOnce.
+  let hysteresisActive = false;
   function writeIntegrateUniforms(seed) {
     intUniDV.setUint32(0, RAYS_PER_PROBE, true);
     intUniDV.setUint32(4, PROBE_COUNT, true);
     intUniDV.setFloat32(8, WEBGPU_DEPTH_RANGE, true);
     intUniDV.setFloat32(12, seed, true);
+    intUniDV.setFloat32(16, hysteresisActive ? hysteresisValue : 0.0, true);
+    intUniDV.setFloat32(20, hasBakedOnce ? 0.0 : 1.0, true);
+    intUniDV.setFloat32(24, 0, true);
+    intUniDV.setFloat32(28, 0, true);
     device.queue.writeBuffer(intUniBuf, 0, intUniArr);
   }
   writeIntegrateUniforms(0);
@@ -2527,6 +2580,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
       { binding: 1, resource: { buffer: rayHitsBuf } },
       { binding: 2, resource: { buffer: probeOctBuf } },
       { binding: 3, resource: { buffer: probeDepthBuf } },
+      { binding: 4, resource: { buffer: probeOctPrevBuf } },
     ],
   });
 
@@ -2567,11 +2621,12 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     uProbeMin    = uniform(PROBE_MIN.clone());
     uProbeMax    = uniform(PROBE_MAX.clone());
     uProbeDims   = uniform(PROBE_DIMS.clone());
-    // Default 2.0: ACES tonemapping at exposure 1.3 compresses small bleed
-    // contributions (typically 0.05–0.2) below visible-difference threshold
-    // when direct light is at ~1.0. Doubling the multiplier puts colored
-    // bleed above the noise floor of the tonemap curve.
-    uGiIntensity = uniform(2.0);
+    // Default 1.0 — the principled value. Previously 2.0 as an empirical
+    // workaround for ACES tonemapping crushing the noisy single-frame
+    // octahedral estimate; now that the integrate pass blends with temporal
+    // hysteresis (≈0.97 retention), effective sample count grows over time
+    // and color bleed survives ACES on its own. Slider remains for tuning.
+    uGiIntensity = uniform(1.0);
     uGiEnabled   = uniform(1.0);
     uGiMode      = uniform(5.0);
     uGiPiFactor  = uniform(1.0);
@@ -2701,9 +2756,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let frameSeed = 0;
   const stats = new Stats();
 
-  async function bakeOnce(indirectScale) {
+  async function bakeOnce(indirectScale, useHysteresis = false) {
     frameSeed = (frameSeed + 1) & 0xffff;
     packRTUniforms(frameSeed, indirectScale);
+    hysteresisActive = useHysteresis;
     writeIntegrateUniforms(frameSeed);
 
     const enc = device.createCommandEncoder({ label: 'ddgi-bake' });
@@ -2770,6 +2826,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     updateDebugProbeColors();
     updateDebugRayLines(debugRays, frameSeed);
     relocateProbes(debugRays, frameSeed);
+    // After the first integrate pass has written real data into probeOct,
+    // subsequent dispatches can blend with the previous frame's value.
+    hasBakedOnce = true;
   }
 
   // Probe relocation: nudge each probe away from nearby geometry by averaging
@@ -2908,11 +2967,24 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     try {
       do {
         bakeRequested = false;
+        // Snapshot previous-bake's final probeOct into probeOctPrevBuf so the
+        // last bounce of this bake can blend against it (hysteresis target).
+        // Done once per bake — intermediate bounces clobber probeOctBuf but
+        // the snapshot stays untouched until next bake.
+        {
+          const enc = device.createCommandEncoder({ label: 'snapshot-prev-oct' });
+          enc.copyBufferToBuffer(probeOctBuf, 0, probeOctPrevBuf, 0, probeOctBufBytes);
+          device.queue.submit([enc.finish()]);
+        }
         // First bounce reads zero SH; second+ reads the previous bounce. The
         // indirect scale starts at 0 (so the first bake captures pure direct
-        // light) and ramps to 1 on subsequent bakes.
+        // light) and ramps to 1 on subsequent bakes. Only the *last* bounce
+        // applies hysteresis (blending into probeOctPrev = previous bake's
+        // result); intermediate bounces full-replace so multi-bounce
+        // transport resolves cleanly within a single bake.
         for (let b = 0; b < bounces; b++) {
-          await bakeOnce(b === 0 ? 0.0 : 1.0);
+          const isLast = (b === bounces - 1);
+          await bakeOnce(b === 0 ? 0.0 : 1.0, isLast);
           bc(`RT bake bounce ${b + 1}/${bounces}`);
         }
       } while (bakeRequested);
@@ -2930,7 +3002,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   // ---------- GUI ----------
   const params = {
     giEnabled: true,
-    giIntensity: 2.0,
+    giIntensity: 1.0,
+    giHysteresis: 0.97,
+    liveBake: true,
+    bakeEveryN: 4,
     chebyshevEnabled: true,
     depthBias: 0.12,
     chebyshevFloor: 0.0,
@@ -2951,6 +3026,18 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   const fGI = gui.addFolder('GI');
   fGI.add(params, 'giEnabled').name('GI enabled').onChange(v => uGiEnabled.value = v ? 1 : 0);
   fGI.add(params, 'giIntensity', 0, 3, 0.05).name('GI intensity').onChange(v => uGiIntensity.value = v);
+  // Temporal hysteresis: per-frame retention for the octahedral integrate
+  // pass. Pushed into `hysteresisValue` (a free variable that
+  // writeIntegrateUniforms closes over) so the next bake picks it up.
+  // Slider tops out at 0.99 so 1.0 (= freeze) is a deliberate edit, not a
+  // slider mishap.
+  hysteresisValue = params.giHysteresis;
+  fGI.add(params, 'giHysteresis', 0, 0.99, 0.01).name('Hysteresis').onChange(v => { hysteresisValue = v; });
+  // Live bake: re-runs the DDGI integrate pass every N frames so the
+  // mover cube's bounce light follows it in real time. Disabling falls
+  // back to manual rebakes (slider changes / Rebake button only).
+  fGI.add(params, 'liveBake').name('Live bake');
+  fGI.add(params, 'bakeEveryN', 1, 30, 1).name('Bake every N frames');
   fGI.add(params, 'chebyshevEnabled').name('Chebyshev visibility').onChange(v => {
     uChebyshevEnabled.value = v ? 1 : 0;
     if (v) scheduleRebake();
@@ -2994,10 +3081,24 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
   const clock = new THREE.Clock();
   let rafId, stopped = false, firstFrame = true;
+  let liveBakeFrameCounter = 0;
   async function tick() {
     if (stopped) return;
     const dt = clock.getDelta();
     controls.update();
+
+    // Live DDGI: re-bake every Nth frame at 1 bounce. Multi-bounce light
+    // transport accumulates *temporally* through the integrate pass's
+    // hysteresis blend (each bake bounces off the previous bake's cache),
+    // which is how the real-time DDGI in Majercik 2019 gets multi-bounce
+    // for ~the cost of one bounce per frame. params.bakeEveryN throttles
+    // bake frequency; bakeInFlight guards against re-entry so a slow bake
+    // can't pile up.
+    liveBakeFrameCounter = (liveBakeFrameCounter + 1) % Math.max(1, params.bakeEveryN | 0);
+    if (params.liveBake && liveBakeFrameCounter === 0 && !bakeInFlight) {
+      bakeAllProbes(1);
+    }
+
     try {
       await renderer.renderAsync(scene, camera);
       if (firstFrame) {
