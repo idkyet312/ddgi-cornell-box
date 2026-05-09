@@ -47,10 +47,10 @@
 <body>
 
 <div id="scene-picker">
-  <button data-scene="webgl" class="active">WebGL · basic</button>
+  <button data-scene="webgl">WebGL · basic</button>
   <button data-scene="webgpu">WebGPU · depth-aware</button>
   <button data-scene="webgpu-simple">WebGPU · simple test</button>
-  <button data-scene="webgpu-rt">WebGPU · raytraced</button>
+  <button data-scene="webgpu-rt" class="active">WebGPU · raytraced</button>
 </div>
 
 <div id="info">
@@ -1764,19 +1764,20 @@ async function createWebGPURTScene(canvas) {
   // Forward-declared so the TSL builder (run later) sees the same array.
   let probeTrappedFloatArr = null;
   function readProbeOctBand0Equivalent(idx) {
-    const probeX = idx * OCT_RES;
+    // Average the interior 8×8 region of probe `idx`'s padded 10×10 tile.
+    const probeX = idx * OCT_RES_P + OCT_PAD;
     let sumR = 0.0;
     let sumG = 0.0;
     let sumB = 0.0;
     for (let ty = 0; ty < OCT_RES; ty++) {
-      let rowOff = (ty * OCT_TEX_W + probeX) * 4;
+      let rowOff = ((ty + OCT_PAD) * OCT_TEX_W + probeX) * 4;
       for (let tx = 0; tx < OCT_RES; tx++, rowOff += 4) {
         sumR += probeOctData[rowOff + 0];
         sumG += probeOctData[rowOff + 1];
         sumB += probeOctData[rowOff + 2];
       }
     }
-    const invTexels = 1.0 / OCT_TEXELS;
+    const invTexels = 1.0 / (OCT_RES * OCT_RES);
     return [sumR * invTexels, sumG * invTexels, sumB * invTexels];
   }
   function updateDebugProbeColors() {
@@ -1826,7 +1827,15 @@ async function createWebGPURTScene(canvas) {
   // GI without ballooning storage. (16×16 would 4× the memory and CPU
   // readback cost; 8×8 hits the sweet spot.)
   const OCT_RES = 8;
-  const OCT_TEXELS = OCT_RES * OCT_RES; // 64
+  // Each probe's tile is padded with a 1-texel border around the interior
+  // 8×8 oct map, populated by a dedicated border pass that mirrors the
+  // octahedral seam. Hardware bilinear sampling across the seam is then
+  // continuous, eliminating per-fragment normal-jitter flicker that the
+  // unpadded layout produced (neighbouring direction-space coords on
+  // opposite sides of the seam map to non-adjacent texels otherwise).
+  const OCT_PAD = 1;
+  const OCT_RES_P = OCT_RES + OCT_PAD * 2; // 10
+  const OCT_TEXELS = OCT_RES_P * OCT_RES_P; // 100
   const probeOctBufBytes = PROBE_COUNT * OCT_TEXELS * 16;
   const probeOctBuf = device.createBuffer({
     label: 'probe-oct',
@@ -2303,7 +2312,9 @@ struct IntUniforms {
 
 const PI: f32 = 3.14159265358979;
 const OCT_RES: u32 = 8u;
-const OCT_TEX: u32 = 64u;
+const OCT_RES_P: u32 = 10u;     // padded tile size (interior 8 + 1 border each side)
+const OCT_PAD: u32 = 1u;
+const OCT_TEX: u32 = 100u;      // padded texel count per probe (10×10)
 
 fn fibSphere(rayI: u32, total: u32, seed: f32) -> vec3<f32> {
   let golden = 0.5 * (sqrt(5.0) - 1.0);
@@ -2349,17 +2360,13 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     depthSum   = depthSum   + dist;
     depthSumSq = depthSumSq + dist * dist;
   }
-  // 2% threshold: any probe with even a few backface rays is grazing/inside
-  // geometry and its directional bins would be unreliable. Mark trapped.
+  // Schmitt trigger on the trapped flag to prevent ray-jitter from oscillating
+  // borderline probes between trapped/active every bake (which made the seed
+  // pass alternately overwrite/not-overwrite, producing visible flicker
+  // when the camera moved). Enter trapped at >5% backface; leave at <2%.
   let backfaceRatio = f32(backfaceCount) / f32(raysPer);
-  let trapped = backfaceRatio > 0.02;
-
-  // Was-this-probe-trapped-last-frame? Stored in the prior probeDepth.w. If a
-  // probe transitions trapped -> active we want to ignore the stale octahedral
-  // (it was zeroed by the integrate pass and then seeded from neighbours) and
-  // start fresh this frame instead of blending in the seed value.
   let wasTrapped = probeDepth[probeIdx].w > 0.5;
-  let justUntrapped = wasTrapped && !trapped;
+  let trapped = select(backfaceRatio > 0.05, backfaceRatio > 0.02, wasTrapped);
 
   let meanD   = clamp(depthSum   / f32(raysPer), 0.0, U.depthRange);
   let meanDSq = max(meanD * meanD, clamp(depthSumSq / f32(raysPer), 0.0, U.depthRange * U.depthRange));
@@ -2374,11 +2381,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let raySeed = U.frameSeed;
   for (var ty: u32 = 0u; ty < OCT_RES; ty = ty + 1u) {
     for (var tx: u32 = 0u; tx < OCT_RES; tx = tx + 1u) {
-      let outIdx = probeIdx * OCT_TEX + ty * OCT_RES + tx;
-      if (trapped) {
-        probeOct[outIdx] = vec4<f32>(0.0);
-        continue;
-      }
+      // Write into the interior of the padded 10×10 tile: column tx+1, row ty+1.
+      let outIdx = probeIdx * OCT_TEX + (ty + OCT_PAD) * OCT_RES_P + (tx + OCT_PAD);
       let texelDir = octDirFromTexel(tx, ty);
       var num = vec3<f32>(0.0);
       var den = 0.0;
@@ -2397,12 +2401,15 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
       // Temporal hysteresis: blend new estimate into the *previous bake's*
       // final value (snapshot taken at bake start, so multi-bounce passes
       // within this bake don't contaminate the blend target). With 256
-      // rays/probe/frame each frame is a noisy Monte Carlo estimate;
-      // blending lets effective sample count grow over time. Skip on the
-      // first bake (probeOctPrev is zeros), when hysteresis is disabled
-      // (intermediate bounces), and when this probe just un-trapped.
+      // rays/probe/frame each bake is a noisy Monte Carlo estimate;
+      // blending lets effective sample count grow over time. Skipped on the
+      // first bake when probeOctPrev is zeros, and on intermediate bounces
+      // (U.hysteresis = 0). Trapped probes blend identically — their result
+      // gets overwritten by the seed pass afterward — so this branch no
+      // longer depends on the trapped flag and won't flicker when ray jitter
+      // pushes a borderline probe across the 2% threshold from bake to bake.
       let prev = probeOctPrev[outIdx].xyz;
-      let useHist = U.hysteresis * (1.0 - U.firstBake) * select(1.0, 0.0, justUntrapped);
+      let useHist = U.hysteresis * (1.0 - U.firstBake);
       let blended = mix(clamped, prev, useHist);
       probeOct[outIdx] = vec4<f32>(blended, 0.0);
     }
@@ -2421,10 +2428,13 @@ struct SeedUniforms {
   dims: vec4<u32>,    // xyz=probe dims, w=numProbes
 };
 @group(0) @binding(0) var<uniform> U: SeedUniforms;
-@group(0) @binding(1) var<storage, read_write> probeOct:   array<vec4<f32>>;  // 64 vec4/probe
+@group(0) @binding(1) var<storage, read_write> probeOct:   array<vec4<f32>>;  // 100 vec4/probe (10×10 padded)
 @group(0) @binding(2) var<storage, read>       probeDepth: array<vec4<f32>>;
 
-const OCT_TEX: u32 = 64u;
+const OCT_RES: u32 = 8u;
+const OCT_RES_P: u32 = 10u;
+const OCT_PAD: u32 = 1u;
+const OCT_TEX: u32 = 100u;
 
 fn flatIdx(x: i32, y: i32, z: i32) -> i32 {
   let dx = i32(U.dims.x);
@@ -2452,37 +2462,152 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     vec3<i32>(0, 0, -1), vec3<i32>(0, 0, 1)
   );
 
-  // For each oct texel, average the same texel from up to 6 healthy neighbours.
-  for (var t: u32 = 0u; t < OCT_TEX; t = t + 1u) {
-    var sum = vec3<f32>(0.0);
-    var count = 0.0;
-    for (var i: u32 = 0u; i < 6u; i = i + 1u) {
-      let o = off[i];
-      let nx = x + o.x;
-      let ny = y + o.y;
-      let nz = z + o.z;
-      if (nx < 0 || nx >= dx) { continue; }
-      if (ny < 0 || ny >= dy) { continue; }
-      if (nz < 0 || nz >= dz) { continue; }
-      let nIdx = flatIdx(nx, ny, nz);
-      if (probeDepth[nIdx].w > 0.5) { continue; }
-      sum = sum + probeOct[u32(nIdx) * OCT_TEX + t].xyz;
-      count = count + 1.0;
-    }
-    if (count > 0.0) {
-      probeOct[probeIdx * OCT_TEX + t] = vec4<f32>(sum / count, 0.0);
+  // For each interior oct texel, average the same texel from up to 6 healthy
+  // neighbours. We only fill the interior; the border pass fixes the borders
+  // afterward.
+  for (var ty: u32 = 0u; ty < OCT_RES; ty = ty + 1u) {
+    for (var tx: u32 = 0u; tx < OCT_RES; tx = tx + 1u) {
+      let texelIdx = (ty + OCT_PAD) * OCT_RES_P + (tx + OCT_PAD);
+      var sum = vec3<f32>(0.0);
+      var count = 0.0;
+      for (var i: u32 = 0u; i < 6u; i = i + 1u) {
+        let o = off[i];
+        let nx = x + o.x;
+        let ny = y + o.y;
+        let nz = z + o.z;
+        if (nx < 0 || nx >= dx) { continue; }
+        if (ny < 0 || ny >= dy) { continue; }
+        if (nz < 0 || nz >= dz) { continue; }
+        let nIdx = flatIdx(nx, ny, nz);
+        if (probeDepth[nIdx].w > 0.5) { continue; }
+        sum = sum + probeOct[u32(nIdx) * OCT_TEX + texelIdx].xyz;
+        count = count + 1.0;
+      }
+      if (count > 0.0) {
+        probeOct[probeIdx * OCT_TEX + texelIdx] = vec4<f32>(sum / count, 0.0);
+      }
     }
   }
+}
+`;
+
+  // 3×3 in-tile box blur over each probe's 8×8 octahedral irradiance map.
+  // Reads from probeOctPrev (which we copy into right after integrate) and
+  // writes into probeOct. Smoothing kills the rotation flicker that came
+  // from per-fragment normal jitter selecting different neighbouring
+  // texels of the oct map (which had visibly different per-texel
+  // irradiance values from Monte Carlo noise + real directional structure).
+  // Border-clamp at tile edges; we don't fold across the octahedral seam
+  // — close enough for diffuse and avoids the seam-mirroring math.
+  const SMOOTH_WGSL = /* wgsl */`
+struct SmoothUniforms {
+  radius: i32,    // box-blur half-width in texels (1 -> 3x3, 2 -> 5x5, 3 -> 7x7)
+  _pad0: i32,
+  _pad1: i32,
+  _pad2: i32,
+};
+@group(0) @binding(0) var<uniform> U: SmoothUniforms;
+@group(0) @binding(1) var<storage, read>       probeOctPrev: array<vec4<f32>>;
+@group(0) @binding(2) var<storage, read_write> probeOct:     array<vec4<f32>>;
+
+const OCT_RES: u32 = 8u;
+const OCT_RES_P: u32 = 10u;
+const OCT_PAD: u32 = 1u;
+const OCT_TEX: u32 = 100u;
+
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let probeIdx = gid.x;
+  let base = probeIdx * OCT_TEX;
+  let r = U.radius;
+  // Smooth only the interior 8×8 — borders are filled later by the border
+  // pass. Inputs and outputs both use interior coords (offset by OCT_PAD
+  // in both axes).
+  for (var ty: u32 = 0u; ty < OCT_RES; ty = ty + 1u) {
+    for (var tx: u32 = 0u; tx < OCT_RES; tx = tx + 1u) {
+      var sum = vec3<f32>(0.0);
+      var count = 0.0;
+      for (var dy: i32 = -r; dy <= r; dy = dy + 1) {
+        for (var dx: i32 = -r; dx <= r; dx = dx + 1) {
+          let nx = i32(tx) + dx;
+          let ny = i32(ty) + dy;
+          if (nx < 0 || nx >= i32(OCT_RES)) { continue; }
+          if (ny < 0 || ny >= i32(OCT_RES)) { continue; }
+          let srcIdx = (u32(ny) + OCT_PAD) * OCT_RES_P + (u32(nx) + OCT_PAD);
+          sum = sum + probeOctPrev[base + srcIdx].xyz;
+          count = count + 1.0;
+        }
+      }
+      let dstIdx = (ty + OCT_PAD) * OCT_RES_P + (tx + OCT_PAD);
+      probeOct[base + dstIdx] = vec4<f32>(sum / count, 0.0);
+    }
+  }
+}
+`;
+
+  // Border pass: fill the 1-texel border of each probe's 10×10 tile by
+  // mirroring across the octahedral seam. With Linear filtering on the
+  // texture, sampling near the interior edge then bleeds smoothly into
+  // the seam-mirrored neighbour rather than into a (clamped) edge texel —
+  // which kills the rotation flicker that came from per-fragment normal
+  // jitter sampling either side of the seam.
+  const BORDER_WGSL = /* wgsl */`
+@group(0) @binding(0) var<storage, read_write> probeOct: array<vec4<f32>>;
+
+const OCT_RES: u32 = 8u;
+const OCT_RES_P: u32 = 10u;
+const OCT_PAD: u32 = 1u;
+const OCT_TEX: u32 = 100u;
+
+fn interiorIdx(ix: u32, iy: u32) -> u32 {
+  return (iy + OCT_PAD) * OCT_RES_P + (ix + OCT_PAD);
+}
+fn paddedIdx(px: u32, py: u32) -> u32 {
+  return py * OCT_RES_P + px;
+}
+
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let probeIdx = gid.x;
+  let base = probeIdx * OCT_TEX;
+  // Edge mirroring: each border texel reads from the diagonally-mirrored
+  // interior texel on the same edge. (See Cigolle 2014 / NVIDIA RTXGI.)
+  for (var i: u32 = 0u; i < OCT_RES; i = i + 1u) {
+    let mi = OCT_RES - 1u - i;
+    // Top border row (py=0): mirror from interior row 0, column OCT_RES-1-i.
+    probeOct[base + paddedIdx(i + OCT_PAD, 0u)] =
+      probeOct[base + interiorIdx(mi, 0u)];
+    // Bottom border row (py=OCT_RES_P-1): mirror from interior row OCT_RES-1.
+    probeOct[base + paddedIdx(i + OCT_PAD, OCT_RES_P - 1u)] =
+      probeOct[base + interiorIdx(mi, OCT_RES - 1u)];
+    // Left border col (px=0): mirror from interior col 0, row OCT_RES-1-i.
+    probeOct[base + paddedIdx(0u, i + OCT_PAD)] =
+      probeOct[base + interiorIdx(0u, mi)];
+    // Right border col (px=OCT_RES_P-1): mirror from interior col OCT_RES-1.
+    probeOct[base + paddedIdx(OCT_RES_P - 1u, i + OCT_PAD)] =
+      probeOct[base + interiorIdx(OCT_RES - 1u, mi)];
+  }
+  // Corners: diagonally-opposite interior corners.
+  probeOct[base + paddedIdx(0u, 0u)] =
+    probeOct[base + interiorIdx(OCT_RES - 1u, OCT_RES - 1u)];
+  probeOct[base + paddedIdx(OCT_RES_P - 1u, 0u)] =
+    probeOct[base + interiorIdx(0u, OCT_RES - 1u)];
+  probeOct[base + paddedIdx(0u, OCT_RES_P - 1u)] =
+    probeOct[base + interiorIdx(OCT_RES - 1u, 0u)];
+  probeOct[base + paddedIdx(OCT_RES_P - 1u, OCT_RES_P - 1u)] =
+    probeOct[base + interiorIdx(0u, 0u)];
 }
 `;
 
   const rtModule = device.createShaderModule({ label: 'ddgi-rt', code: RT_WGSL });
   const intModule = device.createShaderModule({ label: 'ddgi-integrate', code: INTEGRATE_WGSL });
   const seedModule = device.createShaderModule({ label: 'ddgi-seed', code: SEED_WGSL });
+  const smoothModule = device.createShaderModule({ label: 'ddgi-smooth', code: SMOOTH_WGSL });
+  const borderModule = device.createShaderModule({ label: 'ddgi-border', code: BORDER_WGSL });
   // Surface compilation diagnostics — WebGPU's uncaptured-error log truncates
   // the message and doesn't include line numbers. getCompilationInfo() returns
   // structured (lineNum, linePos, message) records we can format ourselves.
-  for (const [label, mod, src] of [['ddgi-rt', rtModule, RT_WGSL], ['ddgi-integrate', intModule, INTEGRATE_WGSL], ['ddgi-seed', seedModule, SEED_WGSL]]) {
+  for (const [label, mod, src] of [['ddgi-rt', rtModule, RT_WGSL], ['ddgi-integrate', intModule, INTEGRATE_WGSL], ['ddgi-seed', seedModule, SEED_WGSL], ['ddgi-smooth', smoothModule, SMOOTH_WGSL], ['ddgi-border', borderModule, BORDER_WGSL]]) {
     mod.getCompilationInfo().then(info => {
       if (!info.messages.length) return;
       const lines = src.split('\n');
@@ -2508,6 +2633,16 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     label: 'ddgi-seed-pipeline',
     layout: 'auto',
     compute: { module: seedModule, entryPoint: 'main' },
+  });
+  const smoothPipeline = device.createComputePipeline({
+    label: 'ddgi-smooth-pipeline',
+    layout: 'auto',
+    compute: { module: smoothModule, entryPoint: 'main' },
+  });
+  const borderPipeline = device.createComputePipeline({
+    label: 'ddgi-border-pipeline',
+    layout: 'auto',
+    compute: { module: borderModule, entryPoint: 'main' },
   });
 
   // Seed-pass uniforms: probe dims (x,y,z,numProbes).
@@ -2592,19 +2727,48 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
       { binding: 2, resource: { buffer: probeDepthBuf } },
     ],
   });
+  const smoothUniBuf = device.createBuffer({
+    label: 'smooth-uniforms',
+    size: 16,
+    usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+  });
+  const smoothUniArr = new Int32Array(4);
+  function writeSmoothUniforms(radius) {
+    smoothUniArr[0] = radius | 0;
+    device.queue.writeBuffer(smoothUniBuf, 0, smoothUniArr);
+  }
+  writeSmoothUniforms(2);
+  const smoothBindGroup = device.createBindGroup({
+    layout: smoothPipeline.getBindGroupLayout(0),
+    entries: [
+      { binding: 0, resource: { buffer: smoothUniBuf } },
+      { binding: 1, resource: { buffer: probeOctPrevBuf } },
+      { binding: 2, resource: { buffer: probeOctBuf } },
+    ],
+  });
+  const borderBindGroup = device.createBindGroup({
+    layout: borderPipeline.getBindGroupLayout(0),
+    entries: [
+      { binding: 0, resource: { buffer: probeOctBuf } },
+    ],
+  });
 
   // ---------- TSL fragment graph (octahedral 8×8 per probe) ----------
   // Each probe's irradiance lives in an 8×8 RGBA-float texel block. We pack
   // all PROBE_COUNT blocks horizontally into a single 2D DataTexture of size
   // (PROBE_COUNT * 8, 8). Blob k is at columns [k*8 .. k*8+8). Probe lookup
-  // = sample 4 texels manually for bilinear within the probe's tile (a real
-  // bilinear sampler would bleed across probe tile boundaries).
-  const OCT_TEX_W = PROBE_COUNT * OCT_RES; // 2744 for 343 probes
-  const OCT_TEX_H = OCT_RES;                // 8
+  // Each probe gets a (OCT_RES_P × OCT_RES_P) = 10×10 tile. Interior 8×8 is
+  // the actual oct map; the 1-texel border around it mirrors the
+  // octahedral seam so hardware bilinear sampling across the seam is
+  // continuous. With Linear filter on, we no longer need manual bilinear
+  // in the fragment shader — and the per-fragment normal jitter that used
+  // to flicker is now smoothed by the texture sampler instead.
+  const OCT_TEX_W = PROBE_COUNT * OCT_RES_P; // 3430 for 343 probes
+  const OCT_TEX_H = OCT_RES_P;                // 10
   const probeOctData = new Float32Array(OCT_TEX_W * OCT_TEX_H * 4);
   const probeOctTex = new THREE.DataTexture(probeOctData, OCT_TEX_W, OCT_TEX_H, THREE.RGBAFormat, THREE.FloatType);
-  probeOctTex.minFilter = THREE.NearestFilter;
-  probeOctTex.magFilter = THREE.NearestFilter;
+  probeOctTex.minFilter = THREE.LinearFilter;
+  probeOctTex.magFilter = THREE.LinearFilter;
   probeOctTex.wrapS = THREE.ClampToEdgeWrapping;
   probeOctTex.wrapT = THREE.ClampToEdgeWrapping;
   probeOctTex.needsUpdate = true;
@@ -2659,50 +2823,53 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
       return uv.mul(0.5).add(0.5); // 0..1
     };
 
-    // Read a single oct texel (no filtering) for probe pi at integer texel
-    // (tx, ty) ∈ [0..7]^2. The texture x-coord = pi * 8 + tx + 0.5.
-    const fetchOctTexel = (pi, tx, ty) => {
-      const u = pi.mul(OCT_F).add(tx).add(0.5).div(TEX_W);
-      const v = ty.add(0.5).div(TEX_H);
-      return uOctTex.sample(vec2(u, v)).rgb;
-    };
-
-    // Bilinear-blend 4 texels within a single probe's tile. We do it
-    // manually so the blend never crosses into a neighbouring probe's tile
-    // (which would happen with a hardware linear filter at the seam).
-    const sampleProbeOct = (pi, n) => {
-      const uv  = octEncode(n).mul(OCT_F).sub(0.5);
-      const x0  = uv.x.floor().clamp(0.0, OCT_RES - 1);
-      const y0  = uv.y.floor().clamp(0.0, OCT_RES - 1);
-      const x1  = x0.add(1.0).min(float(OCT_RES - 1));
-      const y1  = y0.add(1.0).min(float(OCT_RES - 1));
-      const fx  = uv.x.sub(x0).clamp(0.0, 1.0);
-      const fy  = uv.y.sub(y0).clamp(0.0, 1.0);
-      const c00 = fetchOctTexel(pi, x0, y0);
-      const c10 = fetchOctTexel(pi, x1, y0);
-      const c01 = fetchOctTexel(pi, x0, y1);
-      const c11 = fetchOctTexel(pi, x1, y1);
-      const cx0 = c00.mix(c10, fx);
-      const cx1 = c01.mix(c11, fx);
-      return cx0.mix(cx1, fy);
+    // Hardware bilinear sample of probe `piInt`'s 8×8 oct map at direction
+    // `n`. The probe's interior occupies texels [piInt*10+1 .. piInt*10+9)
+    // horizontally and [1..9) vertically inside the (PROBE_COUNT*10 × 10)
+    // DataTexture. The 1-texel border around the interior is filled by
+    // the border pass with seam-mirrored values, so a Linear sampler can
+    // bleed across the octahedral seam smoothly — this is the standard
+    // DDGI way to make the lookup continuous in direction space and the
+    // fix for per-fragment normal-jitter rotation flicker.
+    const sampleProbeOct = (piInt, n) => {
+      const uv01 = octEncode(n).clamp(vec2(0.0), vec2(1.0));
+      // The interior 8 texels of probe piInt's padded tile span pixel
+      // positions [piInt*10+1 .. piInt*10+9). For uv01 ∈ [0..1] we want
+      // pixel = piInt*10 + 1 + uv01*8: at uv01=0 the bilinear tap mixes
+      // border-texel (seam-mirrored) and interior-edge-texel; at uv01=1
+      // it mixes interior-edge and border similarly. This makes the
+      // sample continuous across the oct seam — the rotation-flicker fix.
+      const fpi = float(piInt);
+      const px  = fpi.mul(float(OCT_RES_P)).add(float(OCT_PAD)).add(uv01.x.mul(float(OCT_RES)));
+      const py  = float(OCT_PAD).add(uv01.y.mul(float(OCT_RES)));
+      return uOctTex.sample(vec2(px.div(TEX_W), py.div(TEX_H))).rgb;
     };
 
     const giSampleFn = Fn(([wp, n]) => {
-      const grid = wp.sub(uProbeMin).div(uProbeMax.sub(uProbeMin))
+      // Apply a normal-direction bias to the lookup point. Pushing the
+      // shading position off the surface along its normal prevents probe-
+      // cell boundaries that run flush along walls from producing visible
+      // seam steps in the final lighting (the cell boundary still exists,
+      // but the shading point is now sampling the cage from off the wall
+      // rather than right at the seam). Standard DDGI sampling-side fix.
+      const wpBiased = wp.add(n.mul(uDepthBias));
+      const grid = wpBiased.sub(uProbeMin).div(uProbeMax.sub(uProbeMin))
                    .clamp(vec3(0.0), vec3(1.0))
                    .mul(uProbeDims.sub(vec3(1.0)));
-      const baseIdx = grid.min(uProbeDims.sub(vec3(1.0001))).floor();
+      const baseIdxX = int(grid.x.min(uProbeDims.x.sub(float(1.0001))).floor());
+      const baseIdxY = int(grid.y.min(uProbeDims.y.sub(float(1.0001))).floor());
+      const baseIdxZ = int(grid.z.min(uProbeDims.z.sub(float(1.0001))).floor());
+      const baseIdx = vec3(float(baseIdxX), float(baseIdxY), float(baseIdxZ));
       const fracIdx = grid.sub(baseIdx).clamp(vec3(0.0), vec3(1.0));
       const probeSpacing = uProbeMax.sub(uProbeMin).div(uProbeDims.sub(vec3(1.0)));
-      const Dx   = uProbeDims.x;
-      const DxDy = uProbeDims.x.mul(uProbeDims.y);
-      const wpBiased = wp.add(n.mul(uDepthBias));
+      const DxI   = int(uProbeDims.x);
+      const DxDyI = int(uProbeDims.x.mul(uProbeDims.y));
       let sum = vec3(0.0).toVar();
       let wSum = float(0.0).toVar();
       for (let cz = 0; cz < 2; cz++) for (let cy = 0; cy < 2; cy++) for (let cx = 0; cx < 2; cx++) {
-        const ix = baseIdx.x.add(float(cx));
-        const iy = baseIdx.y.add(float(cy));
-        const iz = baseIdx.z.add(float(cz));
+        const ixI = baseIdxX.add(int(cx));
+        const iyI = baseIdxY.add(int(cy));
+        const izI = baseIdxZ.add(int(cz));
         const tx = cx === 0 ? float(1.0).sub(fracIdx.x) : fracIdx.x;
         const ty = cy === 0 ? float(1.0).sub(fracIdx.y) : fracIdx.y;
         const tz = cz === 0 ? float(1.0).sub(fracIdx.z) : fracIdx.z;
@@ -2710,10 +2877,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         const sy = ty.mul(ty).mul(float(3.0).sub(ty.mul(2.0)));
         const sz = tz.mul(tz).mul(float(3.0).sub(tz.mul(2.0)));
         const triWeight = sx.mul(sy).mul(sz);
-        const flatF = iz.mul(DxDy).add(iy.mul(Dx)).add(ix);
-        const piInt = int(flatF);
-        const pi    = float(flatF);
-        const idxV       = vec3(ix, iy, iz);
+        const piInt = izI.mul(DxDyI).add(iyI.mul(DxI)).add(ixI);
+        const idxV       = vec3(float(ixI), float(iyI), float(izI));
         const probeWorld = uProbeMin.add(idxV.mul(probeSpacing));
         const dist       = wpBiased.sub(probeWorld).length();
         const dMean      = uDepthMean.element(piInt);
@@ -2723,10 +2888,21 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         const chebyshevRaw = variance.div(variance.add(distExcess.mul(distExcess))).clamp(0.0, 1.0);
         const chebyshev    = chebyshevRaw.mul(chebyshevRaw);
         const visWeight  = uChebyshevFloor.mix(chebyshev, uChebyshevEnabled).max(uChebyshevFloor);
+        // Trapped probes get a soft 0.25 weight floor instead of being zeroed
+        // out. Hard-zeroing causes per-frame popping when a borderline probe
+        // flips trapped/active between bakes (the trilinear cage's other
+        // probes have to renormalize, jumping the result). The seed pass
+        // already filled trapped probes with a neighbour-averaged value, so
+        // they contribute *something* sensible — better to lerp toward that
+        // than to discard it.
         const trappedFlag = uProbeTrapped.element(piInt);
-        const aliveMask   = float(1.0).sub(trappedFlag);
-        const weight     = triWeight.mul(visWeight).max(float(1e-5)).mul(aliveMask);
-        const irr = sampleProbeOct(pi, n).max(vec3(0.0));
+        const aliveMask   = float(1.0).sub(trappedFlag.mul(0.75));
+        // No `.max(1e-5)` floor: that floor caused horizontal seam lines at
+        // probe-cell boundaries because it kept zero-weight probes
+        // contributing a tiny constant when the cage shifted across the
+        // boundary, instead of letting trilinear smoothly hand off.
+        const weight     = triWeight.mul(visWeight).mul(aliveMask);
+        const irr = sampleProbeOct(piInt, n).max(vec3(0.0));
         sum  = sum.add(irr.mul(weight));
         wSum = wSum.add(weight);
       }
@@ -2787,6 +2963,34 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
       pass.dispatchWorkgroups(Math.ceil(PROBE_COUNT / 64));
       pass.end();
     }
+    // Snapshot post-seed probeOct into probeOctPrev so the smooth pass can
+    // read it without racing its own writes. probeOctPrev is otherwise idle
+    // at this point — its hysteresis duty for this bake is already done.
+    enc.copyBufferToBuffer(probeOctBuf, 0, probeOctPrevBuf, 0, probeOctBufBytes);
+    {
+      // Smooth-pass: in-tile box blur over each probe's interior 8×8 oct
+      // map. Reduces texel-to-texel variance from Monte Carlo noise so the
+      // hardware bilinear lookup in the fragment shader returns a smoothly
+      // varying value across direction space.
+      const pass = enc.beginComputePass({ label: 'smooth-pass' });
+      pass.setPipeline(smoothPipeline);
+      pass.setBindGroup(0, smoothBindGroup);
+      pass.dispatchWorkgroups(Math.ceil(PROBE_COUNT / 64));
+      pass.end();
+    }
+    {
+      // Border-pass: fill the 1-texel border of each probe's 10×10 tile by
+      // mirroring across the octahedral seam. With Linear texture filter
+      // on, the fragment shader's bilinear sample near the interior edge
+      // then bleeds smoothly into the seam-mirrored neighbour rather than
+      // into a clamped edge texel — this is the standard DDGI fix for
+      // direction-space discontinuity at the oct seam.
+      const pass = enc.beginComputePass({ label: 'border-pass' });
+      pass.setPipeline(borderPipeline);
+      pass.setBindGroup(0, borderBindGroup);
+      pass.dispatchWorkgroups(Math.ceil(PROBE_COUNT / 64));
+      pass.end();
+    }
     enc.copyBufferToBuffer(probeOctBuf, 0, probeOctReadBuf, 0, probeOctBufBytes);
     enc.copyBufferToBuffer(probeDepthBuf, 0, probeDepthReadBuf, 0, PROBE_COUNT * 16);
     // Debug: copy every probe's rays into the staging buffer for full-scene
@@ -2802,18 +3006,28 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     const octView = new Float32Array(probeOctReadBuf.getMappedRange());
     const dView  = new Float32Array(probeDepthReadBuf.getMappedRange());
     for (let p = 0; p < PROBE_COUNT; p++) {
+      // Each probe is OCT_RES_P × OCT_RES_P = 10×10 in the GPU buffer
+      // (interior 8×8 + 1-texel border). Copy the whole tile into the
+      // matching column block of the wide DataTexture.
       const probeSrc = p * OCT_TEXELS * 4;
-      const probeDstX = p * OCT_RES;
-      for (let ty = 0; ty < OCT_RES; ty++) {
-        const srcOff = probeSrc + ty * OCT_RES * 4;
+      const probeDstX = p * OCT_RES_P;
+      for (let ty = 0; ty < OCT_RES_P; ty++) {
+        const srcOff = probeSrc + ty * OCT_RES_P * 4;
         const dstOff = (ty * OCT_TEX_W + probeDstX) * 4;
-        probeOctData.set(octView.subarray(srcOff, srcOff + OCT_RES * 4), dstOff);
+        probeOctData.set(octView.subarray(srcOff, srcOff + OCT_RES_P * 4), dstOff);
       }
       probeDepthMeanArr[p]   = dView[p * 4 + 0];
       probeDepthMeanSqArr[p] = dView[p * 4 + 1];
       const trapped = dView[p * 4 + 3] > 0.5;
       probeTrappedFlags[p]   = trapped;
-      if (probeTrappedFloatArr) probeTrappedFloatArr[p] = trapped ? 1.0 : 0.0;
+      if (probeTrappedFloatArr) {
+        // Temporally smooth the trapped float so a probe that flips
+        // trapped/active between bakes doesn't yank weight in/out of the
+        // trilinear blend in one step (which reads as flicker on rotation).
+        // Lerp toward the new flag at 0.2 per bake -> ~5-bake fade.
+        const target = trapped ? 1.0 : 0.0;
+        probeTrappedFloatArr[p] = probeTrappedFloatArr[p] * 0.8 + target * 0.2;
+      }
     }
     probeOctTex.needsUpdate = true;
     // Debug: pull every probe's rays and rebuild the line visualization.
@@ -2825,7 +3039,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     stats.totalProbeUpdates += PROBE_COUNT;
     updateDebugProbeColors();
     updateDebugRayLines(debugRays, frameSeed);
-    relocateProbes(debugRays, frameSeed);
+    if (params && params.relocateProbes) {
+      relocateProbes(debugRays, frameSeed);
+    }
     // After the first integrate pass has written real data into probeOct,
     // subsequent dispatches can blend with the previous frame's value.
     hasBakedOnce = true;
@@ -2976,15 +3192,17 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
           enc.copyBufferToBuffer(probeOctBuf, 0, probeOctPrevBuf, 0, probeOctBufBytes);
           device.queue.submit([enc.finish()]);
         }
-        // First bounce reads zero SH; second+ reads the previous bounce. The
-        // indirect scale starts at 0 (so the first bake captures pure direct
-        // light) and ramps to 1 on subsequent bakes. Only the *last* bounce
-        // applies hysteresis (blending into probeOctPrev = previous bake's
-        // result); intermediate bounces full-replace so multi-bounce
-        // transport resolves cleanly within a single bake.
+        // For live bakes (bounces=1) we always pass indirectScale=1.0 so the
+        // RT pass reads the previous bake's converged cache as the indirect
+        // input — multi-bounce light transport accumulates *temporally*
+        // through hysteresis, not within a single bake. This is the
+        // standard real-time DDGI loop. For multi-bounce initial bakes
+        // (bounces>1) we still ramp 0->1 per-bounce so the very first
+        // bounce captures pure direct, and only the last bounce blends.
         for (let b = 0; b < bounces; b++) {
           const isLast = (b === bounces - 1);
-          await bakeOnce(b === 0 ? 0.0 : 1.0, isLast);
+          const indirectScale = (bounces === 1) ? 1.0 : (b === 0 ? 0.0 : 1.0);
+          await bakeOnce(indirectScale, isLast);
           bc(`RT bake bounce ${b + 1}/${bounces}`);
         }
       } while (bakeRequested);
@@ -3006,6 +3224,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     giHysteresis: 0.97,
     liveBake: true,
     bakeEveryN: 4,
+    relocateProbes: false,
+    smoothRadius: 2,
     chebyshevEnabled: true,
     depthBias: 0.12,
     chebyshevFloor: 0.0,
@@ -3038,6 +3258,17 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   // back to manual rebakes (slider changes / Rebake button only).
   fGI.add(params, 'liveBake').name('Live bake');
   fGI.add(params, 'bakeEveryN', 1, 30, 1).name('Bake every N frames');
+  // Probe relocation: nudges probes away from geometry so trapped probes
+  // escape walls. With it off, probes stay on the regular grid which is
+  // useful for diagnosing flicker (relocation can keep probes drifting
+  // bake-to-bake near walls and shifts which probes contribute to a given
+  // shading point).
+  fGI.add(params, 'relocateProbes').name('Probe relocation');
+  // Oct-map smoothing radius. 0 disables, 1=3×3, 2=5×5, 3=7×7. Higher
+  // radius reduces rotation flicker (per-fragment normal jitter sees
+  // closer-valued neighbouring texels) at the cost of directional
+  // sharpness. Defaults to 2 (5×5) which kills most flicker.
+  fGI.add(params, 'smoothRadius', 0, 4, 1).name('Smooth radius').onChange(v => writeSmoothUniforms(v));
   fGI.add(params, 'chebyshevEnabled').name('Chebyshev visibility').onChange(v => {
     uChebyshevEnabled.value = v ? 1 : 0;
     if (v) scheduleRebake();
@@ -3585,7 +3816,7 @@ vec3 ddgi_sampleGrid( vec3 wp, vec3 n ) {
 }
 
 // ---------- entry point ----------
-loadScene('webgl');
+loadScene('webgpu-rt');
 
 </script>
 </body>
